@@ -1,0 +1,344 @@
+version: "3.9"
+
+name: ecom-microservices
+
+services:
+  # ────────────────────────── Infrastructure ──────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: ecom-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ecom
+      POSTGRES_PASSWORD: ecom123
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ecom"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecom-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: ecom-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ecom-network
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ecom-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672" # management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ecom-network
+
+  # ────────────────────────── Microservices ──────────────────────────
+  identity:
+    build:
+      context: ./services/identity
+      dockerfile: Dockerfile
+    container_name: ecom-identity
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/identity_db
+      SECRET_KEY: super-secret-jwt-key-change-in-production-32chars
+      ALGORITHM: HS256
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  product:
+    build:
+      context: ./services/product
+      dockerfile: Dockerfile
+    container_name: ecom-product
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/product_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  inventory:
+    build:
+      context: ./services/inventory
+      dockerfile: Dockerfile
+    container_name: ecom-inventory
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/inventory_db
+      PRODUCT_SERVICE_URL: http://product:8002
+    depends_on:
+      postgres:
+        condition: service_healthy
+      product:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  cart:
+    build:
+      context: ./services/cart
+      dockerfile: Dockerfile
+    container_name: ecom-cart
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PRODUCT_SERVICE_URL: http://product:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+      product:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - ecom-network
+
+  order:
+    build:
+      context: ./services/order
+      dockerfile: Dockerfile
+    container_name: ecom-order
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/order_db
+      PRODUCT_SERVICE_URL: http://product:8002
+      INVENTORY_SERVICE_URL: http://inventory:8003
+      PAYMENT_SERVICE_URL: http://payment:8006
+      CART_SERVICE_URL: http://cart:8004
+      SHIPPING_SERVICE_URL: http://shipping:8007
+      NOTIFICATION_SERVICE_URL: http://notification:8008
+    depends_on:
+      postgres:
+        condition: service_healthy
+      product:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  payment:
+    build:
+      context: ./services/payment
+      dockerfile: Dockerfile
+    container_name: ecom-payment
+    restart: unless-stopped
+    ports:
+      - "8006:8006"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/payment_db
+      ORDER_SERVICE_URL: http://order:8005
+      NOTIFICATION_SERVICE_URL: http://notification:8008
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  shipping:
+    build:
+      context: ./services/shipping
+      dockerfile: Dockerfile
+    container_name: ecom-shipping
+    restart: unless-stopped
+    ports:
+      - "8007:8007"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/shipping_db
+      ORDER_SERVICE_URL: http://order:8005
+      NOTIFICATION_SERVICE_URL: http://notification:8008
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  notification:
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+    container_name: ecom-notification
+    restart: unless-stopped
+    ports:
+      - "8008:8008"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/notification_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  review:
+    build:
+      context: ./services/review
+      dockerfile: Dockerfile
+    container_name: ecom-review
+    restart: unless-stopped
+    ports:
+      - "8009:8009"
+    environment:
+      DATABASE_URL: postgresql://ecom:ecom123@postgres:5432/review_db
+      PRODUCT_SERVICE_URL: http://product:8002
+      ORDER_SERVICE_URL: http://order:8005
+    depends_on:
+      postgres:
+        condition: service_healthy
+      product:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ecom-network
+
+  gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    container_name: ecom-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SECRET_KEY: super-secret-jwt-key-change-in-production-32chars
+      ALGORITHM: HS256
+      ENFORCE_AUTH: "false"
+    depends_on:
+      identity:
+        condition: service_healthy
+      product:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      cart:
+        condition: service_healthy
+      order:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+      shipping:
+        condition: service_healthy
+      notification:
+        condition: service_healthy
+      review:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks:
+      - ecom-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+
+networks:
+  ecom-network:
+    driver: bridge
+    name: ecom-network
