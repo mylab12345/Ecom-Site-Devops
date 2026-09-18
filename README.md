@@ -2,7 +2,10 @@
 
 **Local-First, Cloud-Later** — Docker Compose local → Jenkins (buildx) → Terraform (Kind + AWS Graviton EKS) → ArgoCD → Observability.
 
-> **Phase 1 ✅ COMPLETE** — All 10 microservices, Dockerfiles, docker-compose.yaml are production-ready. Phases 2-6 scaffolded below.
+> **Phase 1 ✅ · Phase 2 ✅ COMPLETE** — 10 microservices, Dockerfiles and Compose are
+> production-ready, and the CI pipeline (Jenkins → buildx multi-arch → Trivy gate →
+> GitOps tag bump) is delivered in `Jenkinsfile` + `scripts/ci/`. Phases 3-6 are
+> scaffolded below. `make ci` runs the same gate Jenkins runs, on your laptop.
 
 ---
 
@@ -56,14 +59,33 @@
 ```
 Ecom-Site-Devops/
 ├── docker-compose.yaml          # 10 services + postgres + redis + rabbitmq (all healthchecks)
-├── .env.example
-├── Makefile                     # up / down / logs / health / test
+├── .env.example                 # app + CI settings (registry, platforms, trivy, gitops)
+├── Makefile                     # up/down/logs/health/test · ci* · gitops-bump
 ├── README.md                    # you are here
 ├── troubleshooting.md           # connectivity & ARM64 deep dive
+├── Jenkinsfile                  # Phase 2 ✅ declarative pipeline (8 stages)
+├── pyproject.toml               # ruff + pytest config (single definition of "clean")
+├── requirements-dev.txt         # CI tooling pins (pytest, ruff, PyYAML)
+├── .hadolint.yaml .trivyignore   # Dockerfile lint policy · CVE allowlist (empty by default)
 ├── scripts/
 │   ├── init-db.sql              # creates 9 DBs on postgres
 │   ├── seed.sh                  # demo user + cart + order
-│   └── test.sh                  # integration smoke tests (10 services)
+│   ├── test.sh                  # integration smoke tests (10 services, needs stack up)
+│   └── ci/                      # Phase 2 ✅ the pipeline's actual logic (Jenkins calls these)
+│       ├── lint.sh              #   ruff · hadolint · shellcheck · compose/structure contracts
+│       ├── unit-tests.sh        #   pytest, two tiers, JUnit XML (host or container)
+│       ├── build.sh             #   buildx multi-arch build/--push, digests, promote, --print-plan
+│       ├── smoke.sh             #   run each image, assert /health /metrics X-Request-ID
+│       ├── scan.sh              #   Trivy gate → JSON + SARIF + JUnit + decision
+│       ├── gitops-bump.sh       #   rewrite helm image tags, commit, push gitops/main
+│       ├── all.sh               #   every stage in order, locally (`make ci-all`)
+│       └── lib/                 #   services.sh (the registry) · common.sh · yaml/trivy helpers
+├── tests/
+│   ├── test_ci_hygiene.py       # structure tier: registry↔compose↔gateway↔Dockerfile↔Jenkinsfile
+│   ├── test_service_contracts.py# app tier: 10 apps probed via TestClient (no infra needed)
+│   └── ci_probe.py              #   the isolated per-service probe the app tier drives
+├── jenkins/
+│   └── setup.md                 # agent labels, plugins, JCasC, creds, webhooks, runbook, §9 debug
 ├── services/
 │   ├── identity/                # JWT auth (Python 3.12, FastAPI 0.110)
 │   │   ├── Dockerfile           # multi-arch ready, non-root, healthcheck
@@ -215,21 +237,127 @@ Stop: `make down` or `docker compose down -v` (to wipe DBs).
 
 ---
 
+### 4.5 Phase 2 — CI pipeline (local parity)
+
+The pipeline's logic lives in `scripts/ci/`, **not** in the `Jenkinsfile`. Jenkins only
+orchestrates (fan-out, retries, credentials, reports), so `make ci` on a laptop runs the
+identical checks and a red pipeline is reproducible in one command.
+
+```bash
+make ci              # lint + unit tests (no Docker needed)
+make doctor          # what the agent must have: docker · buildx · trivy · hadolint
+make ci-plan         # resolved build matrix (services × platforms × tags)
+make ci-build        # buildx --load for the host arch, then smoke each image
+make ci-scan         # Trivy over the tree (requirements + Dockerfiles), report-only
+make ci-all          # every stage, in order, on this machine
+make ci-test-docker  # the exact test Jenkins runs: python:3.12-slim + all service deps
+
+# The real thing (push + scan gate + promote + GitOps commit):
+make ci-push REGISTRY=docker.io/mylab12345
+make gitops-dry      # preview the bump as a `git apply`-able patch; --commit via `make gitops-bump`
+```
+
+| Stage (`Jenkinsfile`) | Script | Fails the build on |
+|---|---|---|
+| Prepare | `build.sh --ensure-builder-only` | missing toolchain, bad parameter, builder/binfmt cannot start |
+| Lint | `lint.sh` | ruff findings · `bash -n` · YAML parse · secret-looking files in git |
+| Unit tests | `unit-tests.sh` (in `python:3.12-slim`) | any pytest failure, missing deps in strict mode |
+| Build & push | `build.sh --push` ×10 (capped fan-out) | build failure, `/health` not 200, missing manifest entry |
+| Trivy security gate | `scan.sh --mode gate` | HIGH/CRITICAL **with a released fix** (`.trivyignore` = accepted risk) |
+| Promote images | `build.sh --promote` | retag failure (registry-side `imagetools create`) |
+| GitOps bump | `gitops-bump.sh` | malformed `image:` block, push rejection, branch == base branch |
+| E2E smoke (opt-in) | `docker compose up` + `scripts/test.sh` | any cross-service flow regression |
+
+Three decisions worth knowing before you edit anything:
+
+1. **Candidate tag, then promote.** Builds push `<branch>-<sha>`; `latest` is only ever
+   written by the Promote stage, via a registry-side retag. A `latest` that skipped the
+   Trivy gate cannot exist, and `docker buildx imagetools create` means the promoted
+   bytes are exactly the scanned bytes.
+2. **CI never deploys.** The last act of a green build is a commit touching two YAML
+   lines per service (`image.repository`, `image.tag`). Phase 5's ArgoCD reconciles from
+   git, so a rollback is `git revert`, not "replay build #7".
+3. **Multi-arch is the default, `--load` is not.** buildx cannot load a manifest list, so
+   smoke tests run against a single-platform build and the *pushed* manifest list is
+   verified with `imagetools inspect` (both platforms or the build fails). QEMU/arm64
+   emulation is the slow part — `SKIP_MULTIARCH=1` buys a fast loop on feature branches.
+
+Agent setup, credentials, plugins, JCasC, webhooks, timings, and the failure table are in
+**[`jenkins/setup.md`](./jenkins/setup.md)**.
+
+---
+
 ## 5. Roadmap — Phases 2-6 (Local → AWS)
 
-### Phase 2: Jenkins CI — Pipeline-as-Code + Multi-arch
+**How a phase lands** (same every phase, so "done" means one thing):
 
-**Deliverables (next):**
-- `Jenkinsfile` (declarative, 3 stages: Lint/Test → docker buildx → Push to Docker Hub)
-- `jenkins/setup.md` — install Jenkins LTS (2.440+), Docker, buildx, Docker Hub creds, webhook
-- Multi-arch: `docker buildx build --platform linux/amd64,linux/arm64 -t $DOCKERHUB/ecom-$SVC:$TAG --push .` for all 10 services (parallel)
-- Trivy scan gate
-- Commit to bump `helm-charts/*/values.yaml` image tag (GitOps trigger)
+1. Work happens on the phase branch; nothing is committed straight to `main`.
+2. `make ci` green — the gate you can reproduce locally, not a badge on a page.
+3. `git push` the branch → open a PR against `main` with the stage/test/decision tables
+   and an honest "verified here / not verified here" section.
+4. Merge the PR (`gh pr merge --merge`, GitHub-side, matching how Phase 1 landed), then
+   fast-forward the phase branch onto `main` so the next phase starts from the merge commit.
+
+A phase is not complete while its PR is open, and no phase is started on top of an
+unmerged previous one — Phase 4's charts must be able to assume Phase 2's bump contract
+exists in `main`, not just in a branch.
+
+
+### Phase 2: Jenkins CI — Pipeline-as-Code + Multi-arch ✅ COMPLETE
+
+Delivered (2026-09):
+
+- `Jenkinsfile` — declarative, 8 stages, per-service fan-out with a concurrency cap,
+  `catchError` on scans so one finding does not cancel its siblings, `retry(2)` on push.
+- `scripts/ci/{lint,unit-tests,build,smoke,scan,gitops-bump,all}.sh` + `lib/` — every gate
+  is a script first, so laptop and CI agree by construction.
+- Multi-arch buildx for all 10 services (`linux/amd64,linux/arm64`), registry cache,
+  digest capture, and `imagetools` manifest verification. `python:3.12-slim` +
+  `psycopg2-binary` are wheel-clean on arm64, so no cross-toolchain is needed.
+- Trivy gate: HIGH/CRITICAL with `--ignore-unfixed`, per-image JSON + SARIF + JUnit, DB
+  warmed once before the fan-out, `.trivyignore` as an explicit accepted-risk register,
+  and a **hard failure when the binary is missing** (STRICT_TOOLS) instead of a silent skip.
+- GitOps trigger: `helm-charts/*/values.yaml` image block rewritten and pushed to
+  `gitops/main`, with `[skip ci]`, credential redaction, workspace restore, and refusal to
+  guess when a values file is hand-mangled.
+- `jenkins/setup.md` — plugins, JCasC, agent labels, Docker Hub + gitops credentials,
+  GitHub webhook, timings, first-build runbook, §9 failure table.
+- Tests as a CI gate: `tests/` structure tier (registry ↔ compose ↔ gateway routes ↔
+  Dockerfiles ↔ values stubs ↔ Jenkinsfile) and app tier (10 services probed via
+  TestClient with **no** Postgres/Redis/RabbitMQ, proving readiness probes will pass).
+
+Plan adjustments made during implementation, with reasons:
+- "3 stages" became 8: a security gate that runs *after* push cannot be a footnote in the
+  build stage, and the promote/bump split is what keeps `latest` trustworthy.
+- Image names/tags stay driven by `scripts/ci/lib/services.sh` — one registry, asserted
+  against Compose and the gateway map by tests rather than duplicated in YAML.
+- Added a smoke stage (run image → `/health` 200) between load and push: a Dockerfile that
+  builds but cannot boot is the most expensive class of failure to discover at 3 a.m.
+
+What this working environment proved, and what it could not:
+
+- **Proven here** (no docker daemon, no JVM): `make ci` end to end — 198 passing tests
+  (115 structure + 83 app), ruff over 55 modules, `bash -n` over 11 scripts, YAML/tab
+  parse, the Jenkinsfile checker, secrets hygiene. And the GitOps bump against a *real*
+  second writer: two clones pushing one bare remote, where disjoint bumps replay with no
+  lost tag and a conflicting tag is refused with the agent workspace restored
+  (`jenkins/setup.md` §9). `--dry-run` produced a `git apply`-clean patch for all ten charts.
+- **Needs the tools before it is believed**: `build.sh`, `smoke.sh`, `scan.sh` were never
+  executed — this sandbox has no buildx, no daemon and no trivy binary, so multi-arch
+  push, manifest-list verification and the CVE gate are unrun. Each exits **3**, never a
+  simulated pass, so a machine without them fails loudly.
+- **Loaded by Jenkins, not by us**: the `Jenkinsfile` cannot be parsed here, so it is
+  checked offline by `scripts/ci/lib/check_jenkinsfile.py` (delimiter balance, the stage
+  contract, and the two Groovy interpolation traps that parse fine and break at runtime).
+  The first real parse is step one of the runbook in `jenkins/setup.md` §8.
 
 **Local test:**
 ```bash
-docker buildx create --name multi --use
+docker buildx create --name multi --use          # build.sh does this, idempotently
 docker buildx build --platform linux/amd64,linux/arm64 -f services/product/Dockerfile services/product --tag test:multi --load
+# ↑ buildx refuses --load with two platforms; scripts/ci/build.sh narrows --load to the
+#   host arch and pushes the manifest list separately, which is why this is not the README path.
+make ci-plan && make ci-build && make ci-scan    # the supported local equivalents
 ```
 
 ### Phase 3: Infrastructure as Code — Terraform
@@ -278,7 +406,7 @@ helm-charts/
 
 ---
 
-## 6. Stable Versions (Phase 1)
+## 6. Stable Versions (Phases 1-2)
 
 | Tool | Version |
 |------|---------|
@@ -294,7 +422,11 @@ helm-charts/
 |RabbitMQ|3-management-alpine|
 |Terraform|1.7+ (planned)|
 |K8s|1.29+ (planned)|
-|Jenkins|2.440 LTS (planned)|
+|Jenkins|2.440.3 LTS ✅|
+|Docker buildx|0.14+ ✅ (docker-container driver for multi-arch)|
+|Trivy|0.53+ ✅ (`HIGH,CRITICAL`, `--ignore-unfixed`)|
+|hadolint / shellcheck|latest ✅ (advisory in `lint.sh`)|
+|ruff / pytest|0.16.8 / 9.1.1 ✅ pinned in `requirements-dev.txt`|
 
 All Dockerfiles use `python:3.12-slim` — **ARM64 & AMD64 compatible** (no arch-specific wheels). `docker buildx` covers Graviton.
 
@@ -338,12 +470,16 @@ See [troubleshooting.md](./troubleshooting.md) for microservice connectivity & A
 ## 10. Next Action
 
 ```bash
-make up && make health && ./scripts/test.sh
+make up && make health && ./scripts/test.sh   # Phase 1 stack
+make ci && make ci-plan                       # Phase 2 gate, locally
 ```
 
 Open: `http://localhost:8080/docs` (Gateway Swagger), `http://localhost:8080/health`, `http://localhost:15672` (RabbitMQ), `http://localhost:8001/docs` (direct).
 
-**Phase 2 Jenkins guide coming next** — say the word and we scaffold `Jenkinsfile` + Terraform + Helm in one PR.
+**Phase 2 is live**: point a Multibranch Pipeline job at this repo (agent label
+`ecom-buildx`, credentials `dockerhub-creds` + `gitops-token`) and follow
+[`jenkins/setup.md`](./jenkins/setup.md) §8 → §12. Next up is **Phase 3** — Terraform for
+Kind (local) and EKS on Graviton spot (`terraform/local-kind`, `terraform/aws-graviton`).
 
 ---
 

@@ -1,0 +1,30 @@
+# Hadolint policy for the 10 service Dockerfiles (scripts/ci/lint.sh runs it when
+# the binary is available). Suppressions below are deliberate, not accidental:
+# each one is a documented trade-off, and the tests in tests/test_ci_hygiene.py
+# assert the rules we DO care about (EXPOSE/port parity, non-root user,
+# HEALTHCHECK, apt list cleanup) directly, so they cannot regress behind this file.
+#
+# Local run:  hadolint --config .hadolint.yaml services/*/Dockerfile
+# Container:  docker run --rm -v "$PWD:/data" -w /data hadolint/hadolint \
+#               hadolint --config .hadolint.yaml 'services/*/Dockerfile'
+
+failure-threshold: warning
+
+ignored:
+  # DL3008 / DL3009 — apt pins versions & leaves lists behind. We install gcc and
+  # libpq-dev only long enough to compile psycopg2 wheels, then delete
+  # /var/lib/apt/lists in the same layer. Pinning Debian package versions against
+  # python:3.12-slim would need a snapshot mirror per build for no security gain.
+  - DL3008
+  - DL3009
+  # DL3013 / DL3016 / DL3018 — pip pinning policy. Pinning happens in
+  # services/*/requirements.txt (and a test enforces `==` on every line), which is
+  # reviewable per service; repeating it as a CLI flag here would only drift.
+  - DL3013
+  - DL3016
+  - DL3018
+  # DL3059 — "multiple consecutive RUN" layers are intentional: the
+  # requirements.txt layer must stay separate so buildx cache survives source edits.
+  - DL3059
+  # DL4006 — SHELL pipeline failures: the healthchecks use `|| exit 1` explicitly.
+  - DL4006
