@@ -1,630 +1,346 @@
-# E-Commerce Microservices Platform — Production-Grade (10 Services)
+# E-Commerce Microservices Platform
 
-**Local-First, Cloud-Later** — Docker Compose local → Jenkins (buildx) → Terraform (Kind + AWS Graviton EKS) → ArgoCD → Observability.
+Ten FastAPI microservices plus the full delivery platform around them: Docker Compose for
+local dev, a Jenkins CI pipeline that builds multi-arch images and gates them on Trivy,
+Terraform for Kind (laptop) and EKS on Graviton (AWS), Helm charts, ArgoCD GitOps, and a
+Prometheus/Grafana/Loki/Jaeger observability stack.
 
-> **Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ COMPLETE** — 10 microservices,
-> Dockerfiles and Compose are production-ready, CI pipeline (Jenkins → buildx multi-arch
-> → Trivy gate → GitOps tag bump) is delivered, Terraform provisions Kind + EKS Graviton
-> spot (40% saving), and Helm charts deploy 10 services with HPA, PDB, NetworkPolicy and
-> ingress-nginx. Phases 5-6 are scaffolded below. `make ci` runs the same gate Jenkins
-> runs, on your laptop.
+Everything runs on your laptop first. `make ci` executes the same checks Jenkins does, so a
+red pipeline is reproducible in one command.
+
+**Status — all six phases delivered:** Phase 1 ✅ local stack · Phase 2 ✅ CI pipeline ·
+Phase 3 ✅ Terraform · Phase 4 ✅ Helm · Phase 5 ✅ ArgoCD GitOps · Phase 6 ✅ observability.
+
+```
+  compose (local) ──► Jenkins CI ──► git commit ──► ArgoCD ──► Kind / EKS Graviton
+                     build + scan      image tags     reconciles    Helm charts
+                                                                        │
+                                             Prometheus · Grafana · Loki · Jaeger · Trivy
+```
 
 ---
 
-## 1. Architecture Overview
+## 1. Architecture
 
 ```
-                        ┌─────────────┐
-     Client ──►  :8080 ─►│ API Gateway │─► JWT verify via Identity (optional)
-                        └──────┬──────┘
-         ┌─────────────────────┼──────────────────────────────┐
-         │                     │                              │
-   ┌─────▼─────┐  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
-   │ Identity  │  │   Product   │  │  Inventory  │  │    Cart     │
-   │  :8001    │  │   :8002     │  │   :8003     │  │   :8004     │  Redis
-   └───────────┘  └─────────────┘  └─────────────┘  └─────────────┘
-   ┌───────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-   │   Order   │─►│   Payment   │  │  Shipping   │  │Notification │
-   │  :8005    │  │   :8006     │  │   :8007     │  │   :8008     │  RabbitMQ
-   └─────┬─────┘  └─────────────┘  └─────────────┘  └─────────────┘
-         │
-   ┌─────▼─────┐
-   │  Review   │
-   │  :8009    │
-   └───────────┘
-    Postgres (15) — 1 instance, 9 logical DBs + Redis + RabbitMQ
-    ────────────────────────────────────────────────────────────
-    Observability (Phase 6): Prometheus :9090, Grafana :3000, Loki, Jaeger :16686
+                          ┌──────────────┐
+     client ─── :8080 ───►│ API Gateway  │──► optional JWT verification
+                          └──────┬───────┘
+        ┌──────────┬─────────────┼─────────────┬──────────┬──────────┐
+   identity     product      inventory        cart      order     review
+     :8001        :8002         :8003         :8004     :8005      :8009
+                                                       ┌────┴────┐
+                                                    payment   shipping
+                                                     :8006     :8007
+                                                       └────┬────┘
+                                                       notification :8008
+
+   Postgres 15 (one instance, nine logical DBs) · Redis 7 · RabbitMQ 3
 ```
 
-### Service Catalog (10/10 Implemented)
+| # | Service | Port | Gateway prefix | Store | What it actually does |
+|---|---------|------|----------------|-------|-----------------------|
+| 1 | identity | 8001 | `/api/auth` | Postgres | Register/login, JWT (HS256), bcrypt, RBAC, token verify |
+| 2 | product | 8002 | `/api/products` | Postgres | Catalogue CRUD, full-text search, filters, pagination, seeds 8 products |
+| 3 | inventory | 8003 | `/api/inventory` | Postgres | Stock vs. reserved, reserve/release/commit, movement log |
+| 4 | cart | 8004 | `/api/cart` | Redis | 7-day TTL carts, enriches items by calling product |
+| 5 | order | 8005 | `/api/orders` | Postgres | Orchestration: validate → reserve stock → clear cart → trigger shipping/notification |
+| 6 | payment | 8006 | `/api/payments` | Postgres | Idempotent transactions, refunds, webhook, 5% simulated failure |
+| 7 | shipping | 8007 | `/api/shipments` | Postgres | Tracking numbers, status machine pending → shipped → delivered |
+| 8 | notification | 8008 | `/api/notifications` | Postgres + RabbitMQ | Email/SMS/push mocks, bulk send |
+| 9 | review | 8009 | `/api/reviews` | Postgres | 1–5 ratings, averages and distribution, one review per user per product |
+| 10 | gateway | 8080 | `/` | — | Prefix routing, 3× retry with backoff, `X-Request-ID` propagation |
 
-| # | Service | Port | DB | Key Logic | Health | Metrics |
-|---|---------|------|----|-----------|--------|---------|
-|1|**Identity/Auth**|8001|identity_db|JWT (HS256), bcrypt, register/login/verify, RBAC|/health|/metrics|
-|2|**Product Catalog**|8002|product_db|CRUD, full-text search, filtering, pagination, auto-seed 8 products|/health|/metrics|
-|3|**Inventory**|8003|inventory_db|Stock + reserved tracking, reserve/release/commit, movements|/health|/metrics|
-|4|**Cart**|8004|Redis 7|Temporary storage, TTL 7d, product enrichment via Product SVC|/health|/metrics|
-|5|**Order**|8005|order_db|Order orchestration: validates product→reserve inventory→clear cart→async shipping/notification|/health|/metrics|
-|6|**Payment**|8006|payment_db|Idempotent transactions, mock provider, refund, webhook, 5% random fail simulation|/health|/metrics|
-|7|**Shipping**|8007|shipping_db|Tracking number generation, status machine (pending→shipped→delivered), carrier|/health|/metrics|
-|8|**Notification**|8008|notification_db|Email/SMS/Push mock (logs), bulk send, RabbitMQ-ready|/health|/metrics|
-|9|**Review**|8009|review_db|Rating 1-5, stats (avg, distribution), one review per user per product|/health|/metrics|
-|10|**API Gateway**|8080|—|Central routing, X-Request-ID propagation, retry (3x), Prometheus, optional JWT enforcement|/health|/metrics|
+Services talk over internal DNS — `http://product:8002/products/1` in Compose,
+`http://product.ecom.svc.cluster.local:8002` in Kubernetes. The same name works in both, which
+is why nothing needs rewriting between environments. Every service exposes `/health` (the same
+path used by the Dockerfile HEALTHCHECK, the K8s probes, and the CI smoke stage), `/metrics`,
+and echoes `X-Request-ID` + `X-Service`.
 
-**Inter-service communication:** Kubernetes internal DNS (`http://<service>:<port>`) + Docker Compose service names. All services expose `X-Request-ID` and `X-Service`. Retry 3× with exponential backoff.
+`scripts/ci/lib/services.sh` is the single source of truth for this table. `tests/` asserts it
+against `docker-compose.yaml`, the gateway route map, and every Dockerfile, so the registry
+cannot silently drift.
 
 ---
 
-## 2. Directory Tree (Monorepo)
+## 2. Quickstart (local)
 
-```
-Ecom-Site-Devops/
-├── docker-compose.yaml          # 10 services + postgres + redis + rabbitmq (all healthchecks)
-├── .env.example                 # app + CI settings (registry, platforms, trivy, gitops)
-├── Makefile                     # up/down/logs/health/test · ci* · gitops-bump
-├── README.md                    # you are here
-├── troubleshooting.md           # connectivity & ARM64 deep dive
-├── Jenkinsfile                  # Phase 2 ✅ declarative pipeline (8 stages)
-├── pyproject.toml               # ruff + pytest config (single definition of "clean")
-├── requirements-dev.txt         # CI tooling pins (pytest, ruff, PyYAML)
-├── .hadolint.yaml .trivyignore   # Dockerfile lint policy · CVE allowlist (empty by default)
-├── scripts/
-│   ├── init-db.sql              # creates 9 DBs on postgres
-│   ├── seed.sh                  # demo user + cart + order
-│   ├── test.sh                  # integration smoke tests (10 services, needs stack up)
-│   └── ci/                      # Phase 2 ✅ the pipeline's actual logic (Jenkins calls these)
-│       ├── lint.sh              #   ruff · hadolint · shellcheck · compose/structure contracts
-│       ├── unit-tests.sh        #   pytest, two tiers, JUnit XML (host or container)
-│       ├── build.sh             #   buildx multi-arch build/--push, digests, promote, --print-plan
-│       ├── smoke.sh             #   run each image, assert /health /metrics X-Request-ID
-│       ├── scan.sh              #   Trivy gate → JSON + SARIF + JUnit + decision
-│       ├── gitops-bump.sh       #   rewrite helm image tags, commit, push gitops/main
-│       ├── all.sh               #   every stage in order, locally (`make ci-all`)
-│       └── lib/                 #   services.sh (the registry) · common.sh · yaml/trivy helpers
-├── tests/
-│   ├── test_ci_hygiene.py       # structure tier: registry↔compose↔gateway↔Dockerfile↔Jenkinsfile
-│   ├── test_service_contracts.py# app tier: 10 apps probed via TestClient (no infra needed)
-│   └── ci_probe.py              #   the isolated per-service probe the app tier drives
-├── jenkins/
-│   └── setup.md                 # agent labels, plugins, JCasC, creds, webhooks, runbook, §9 debug
-├── services/
-│   ├── identity/                # JWT auth (Python 3.12, FastAPI 0.110)
-│   │   ├── Dockerfile           # multi-arch ready, non-root, healthcheck
-│   │   ├── requirements.txt     # pinned stable
-│   │   └── app/{main,models,schemas,auth,database,config}.py
-│   ├── product/                 # same structure (8002)
-│   ├── inventory/               # (8003)
-│   ├── cart/                    # Redis (8004)
-│   ├── order/                   # orchestration (8005)
-│   ├── payment/                 # idempotent (8006)
-│   ├── shipping/                # tracking (8007)
-│   ├── notification/            # mock email/sms (8008)
-│   ├── review/                  # ratings (8009)
-│   └── gateway/                 # reverse proxy (8080)
-│       ├── app/config.py        # service map
-│       └── app/main.py          # prefix routing + retry
-└── Phase 2-6 Complete:
-    ├── terraform/
-    │   ├── local-kind/          # Phase 3 ✅ Kind 1 CP + 2 workers + local registry mirror (5001)
-    │   └── aws-graviton/        # Phase 3 ✅ AWS EKS 1.29+ Graviton ARM64 Spot (~40% cost saving)
-    ├── helm-charts/             # Phase 4 ✅ 10 service charts + ecom-common + ingress + network-policies
-    ├── argocd/                  # Phase 5 ✅ AppProject, ApplicationSet, root App-of-Apps & 12 Application CRs
-    │   ├── projects/ecom.yaml   #   RBAC & namespace isolation project
-    │   ├── root-app.yaml        #   App-of-Apps root controller
-    │   ├── applicationset.yaml  #   Service-driven generator
-    │   └── applications/        #   Per-service Application manifests
-    └── observability/           # Phase 6 ✅ Full-stack monitoring, logging, tracing & security
-        ├── prometheus/          #   kube-prometheus-stack values, rules & ServiceMonitors
-        ├── grafana/             #   Datasources & 3 production dashboards (Overview, Detail, SLOs)
-        ├── loki/                #   Loki values & Promtail DaemonSet structured logging
-        ├── jaeger/              #   Jaeger all-in-one & OTLP collector configuration
-        └── security/            #   Nightly Trivy CronJob & Pod Security Standards
-```
-
-**Generate tree locally:** `tree -L 4 -I '__pycache__|*.pyc|.git'` or `find . -type f | sort`
-
----
-
-## 3. Prerequisites
-
-- Docker Engine 24+ & Docker Compose v2.20+
-- Make, curl, jq, python3.11+ (for testing)
-- 8 GB RAM, 20 GB disk (local)
-- Ports free: 5432, 6379, 5672, 15672, 8001-8009, 8080
-
-Multi-arch: `docker buildx create --use` (Jenkins does this in Phase 2).
-
----
-
-## 4. Phase 1 — Local Run (100% complete)
-
-### 4.1 Quickstart
+**Needs:** Docker Engine 24+ with Compose v2.20+, Make, curl, jq, Python 3.11+, ~8 GB RAM and
+20 GB disk. Free ports: 5432, 6379, 5672, 15672, 8001–8009, 8080.
 
 ```bash
-git clone https://github.com/mylab12345/Ecom-Site-Devops.git
-cd Ecom-Site-Devops
+git clone https://github.com/mylab12345/Ecom-Site-Devops.git && cd Ecom-Site-Devops
 
-cp .env.example .env          # edit SECRET_KEY for prod
-make up                       # builds + starts 13 containers
-make health                   # gateway aggregated health
-make test                     # smoke tests all 10 services
-
-# Or manually:
-docker compose up -d --build
-docker compose ps
-docker compose logs -f gateway
+cp .env.example .env       # change SECRET_KEY before anything resembling production
+make up                    # builds and starts 13 containers
+make health                # gateway's aggregated view of all ten services
+make test                  # integration smoke test across the whole flow
 ```
 
-**First boot takes ~60s** (postgres init + 9 DB creates + seed + healthchecks). `make health` waits 40s.
-
-### 4.2 Verify via Gateway (port 8080 is the ONLY public entry in prod)
+First boot takes ~60 s: Postgres initialises nine databases, product seeds its catalogue, and
+Compose waits on healthchecks before starting dependents. Open
+[`http://localhost:8080/docs`](http://localhost:8080/docs) for the gateway's Swagger UI.
 
 ```bash
-# Root
-curl http://localhost:8080/ | jq
-
-# Gateway aggregated health (checks all 10 downstream)
-curl http://localhost:8080/health | jq
-
-# Individual service still reachable directly (local dev only)
-curl http://localhost:8001/health
-curl http://localhost:8002/health
-# ... 8003-8009
-
-# Prometheus metrics (each service)
-curl http://localhost:8080/metrics
-curl http://localhost:8002/metrics
+make ps          # container state        make logs     # tail everything
+make seed        # demo user + cart + order
+make down        # stop                   make clean    # stop and wipe volumes
+make doctor      # is the CI toolchain present? (docker, buildx, trivy, hadolint)
 ```
 
-### 4.3 End-to-End Demo (manual)
+Port 8080 is the only public entry point in a real deployment; hitting 8001–8009 directly is a
+local-dev convenience.
+
+---
+
+## 3. End-to-end demo
+
+The whole purchase path, through the gateway. `./scripts/test.sh` runs this with assertions.
 
 ```bash
-# 1. Register & login
-curl -X POST http://localhost:8080/api/auth/register \
-  -H "Content-Type: application/json" \
+GW=http://localhost:8080
+
+# register, then log in and keep the token
+curl -sX POST $GW/api/auth/register -H 'Content-Type: application/json' \
   -d '{"email":"alice@example.com","username":"alice","password":"StrongPass123","full_name":"Alice"}'
+TOKEN=$(curl -sX POST $GW/api/auth/login -d 'username=alice&password=StrongPass123' | jq -r .access_token)
 
-TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=alice&password=StrongPass123" | jq -r .access_token)
+# browse and search the catalogue
+curl -s "$GW/api/products?q=headphones&category=Electronics" | jq
 
-# 2. Browse products (search, filter, category)
-curl "http://localhost:8080/api/products?q=headphones&category=Electronics" | jq
-curl http://localhost:8080/api/products/1 | jq
-curl http://localhost:8080/api/categories/list | jq
+# check stock (bump it with POST /api/inventory/1/adjust -d '{"delta":50}')
+curl -s $GW/api/inventory/1 | jq
 
-# 3. Check inventory
-curl http://localhost:8080/api/inventory/1 | jq
-# adjust: curl -X POST http://localhost:8080/api/inventory/1/adjust -d '{"delta":50}'
+# add to cart (Redis-backed), then read it back enriched with product data
+curl -sX POST $GW/api/cart/alice/items -H 'Content-Type: application/json' \
+  -d '{"product_id":1,"quantity":2}'
+curl -s $GW/api/cart/alice | jq
 
-# 4. Cart (Redis)
-curl -X POST http://localhost:8080/api/cart/alice/items -H "Content-Type: application/json" -d '{"product_id":1,"quantity":2}'
-curl http://localhost:8080/api/cart/alice | jq
+# place the order: reserves inventory and clears the cart
+curl -sX POST $GW/api/orders -H 'Content-Type: application/json' -d '{
+  "user_id":"alice","items":[{"product_id":1,"quantity":2},{"product_id":3,"quantity":1}],
+  "shipping_address":{"street":"221B Baker","city":"London","zip":"NW1"}}' | jq
 
-# 5. Create order (reserves inventory, clears cart)
-curl -X POST http://localhost:8080/api/orders -H "Content-Type: application/json" -d '{
-  "user_id":"alice",
-  "items":[{"product_id":1,"quantity":2},{"product_id":3,"quantity":1}],
-  "shipping_address":{"street":"221B Baker","city":"London","zip":"NW1"}
-}' | jq
-# note order id
+# pay — the Idempotency-Key makes retries safe; force_status:"failed" simulates a decline
+curl -sX POST $GW/api/payments -H 'Content-Type: application/json' -H 'Idempotency-Key: alice-order-1' \
+  -d '{"order_id":1,"user_id":"alice","amount":424.48}' | jq
+curl -sX POST $GW/api/payments/1/process -H 'Content-Type: application/json' -d '{}' | jq
 
-# 6. Payment (idempotent)
-curl -X POST http://localhost:8080/api/payments -H "Content-Type: application/json" -H "Idempotency-Key: alice-order-1" -d '{"order_id":1,"user_id":"alice","amount":424.48}' | jq
-curl -X POST http://localhost:8080/api/payments/1/process -H "Content-Type: application/json" -d '{}' | jq
-# force fail: -d '{"force_status":"failed"}'
+# ship and track
+curl -sX PUT $GW/api/shipments/1/status -H 'Content-Type: application/json' \
+  -d '{"status":"shipped","location":"LHR"}' | jq
 
-# 7. Shipping (auto-created on order confirmed, or manual)
-curl -X POST http://localhost:8080/api/shipments -H "Content-Type: application/json" -d '{"order_id":1,"user_id":"alice","address":{"city":"London"}}' | jq
-curl http://localhost:8080/api/shipments/order/1 | jq
-curl -X PUT http://localhost:8080/api/shipments/1/status -H "Content-Type: application/json" -d '{"status":"shipped","location":"LHR"}' | jq
-curl http://localhost:8080/api/shipments/track/TRK123 | jq
-
-# 8. Review
-curl -X POST http://localhost:8080/api/reviews -H "Content-Type: application/json" -d '{"product_id":1,"user_id":"alice","rating":5,"title":"Amazing","comment":"Best headphones ever"}' | jq
-curl http://localhost:8080/api/reviews/product/1/stats | jq
-
-# 9. Notifications
-curl http://localhost:8080/api/notifications/user/alice | jq
-curl -X POST http://localhost:8080/api/notifications/send -H "Content-Type: application/json" -d '{"user_id":"alice","type":"email","title":"Test","message":"Hello"}' | jq
-
-# 10. Metrics
-curl http://localhost:8080/metrics | head -n 20
+# review, then look at the notification log
+curl -sX POST $GW/api/reviews -H 'Content-Type: application/json' \
+  -d '{"product_id":1,"user_id":"alice","rating":5,"title":"Amazing","comment":"Best headphones ever"}'
+curl -s $GW/api/notifications/user/alice | jq
 ```
-
-**Automated:** `./scripts/test.sh` runs all above with assertions. `./scripts/seed.sh` seeds demo.
-
-### 4.4 Docker Compose Details
-
-- **postgres:15-alpine** with `scripts/init-db.sql` creating 9 DBs. Volume `postgres_data`. Healthcheck `pg_isready`.
-- **redis:7-alpine** with AOF. Healthcheck `redis-cli ping`.
-- **rabbitmq:3-management-alpine** (15672 UI: guest/guest).
-- All 10 services: `restart: unless-stopped`, `healthcheck` (curl), `depends_on: condition: service_healthy`, `networks: ecom-network (bridge)`, `EXPOSE 800x`.
-- Gateway depends on all 9 — guarantees local boot order. K8s later uses readinessProbes.
-
-Stop: `make down` or `docker compose down -v` (to wipe DBs).
 
 ---
 
-### 4.5 Phase 2 — CI pipeline (local parity)
+## 4. Repository layout
 
-The pipeline's logic lives in `scripts/ci/`, **not** in the `Jenkinsfile`. Jenkins only
-orchestrates (fan-out, retries, credentials, reports), so `make ci` on a laptop runs the
-identical checks and a red pipeline is reproducible in one command.
-
-```bash
-make ci              # lint + unit tests (no Docker needed)
-make doctor          # what the agent must have: docker · buildx · trivy · hadolint
-make ci-plan         # resolved build matrix (services × platforms × tags)
-make ci-build        # buildx --load for the host arch, then smoke each image
-make ci-scan         # Trivy over the tree (requirements + Dockerfiles), report-only
-make ci-all          # every stage, in order, on this machine
-make ci-test-docker  # the exact test Jenkins runs: python:3.12-slim + all service deps
-
-# The real thing (push + scan gate + promote + GitOps commit):
-make ci-push REGISTRY=docker.io/mylab12345
-make gitops-dry      # preview the bump as a `git apply`-able patch; --commit via `make gitops-bump`
+```
+docker-compose.yaml        10 services + postgres + redis + rabbitmq, all with healthchecks
+Makefile                   every workflow below; `make help` lists them
+Jenkinsfile.local          the local pipeline: build → deploy to Kind → verify
+Jenkinsfile.aws            the cloud pipeline: build → push → gate → promote → GitOps bump
+.env.example               app config + CI knobs (registry, platforms, trivy, gitops)
+pyproject.toml             ruff + pytest config: one definition of "clean"
+services/<name>/           Dockerfile · requirements.txt · app/{main,models,schemas,config}.py
+scripts/init-db.sql        creates the nine logical databases
+scripts/seed.sh test.sh    demo data · integration smoke test (needs the stack up)
+scripts/ci/                the pipeline's real logic: lint, unit-tests, build, smoke,
+                           scan, gitops-bump, all + lib/ (Jenkins calls these)
+tests/                     structure tier (registry ↔ compose ↔ gateway ↔ Dockerfiles ↔
+                           Jenkinsfile) and app tier (10 apps via TestClient, no infra)
+terraform/local-kind/      Kind: 1 control plane + 2 workers + local registry on :5001
+terraform/aws-graviton/    EKS 1.29 ARM64: VPC, IRSA, on-demand critical + spot stateless
+helm-charts/               ecom-common library, 10 service charts, ingress-nginx,
+                           network-policies (HPA, PDB, probes, security contexts)
+argocd/                    AppProject, ApplicationSet, root App-of-Apps, 12 Applications
+observability/             prometheus · grafana · loki · jaeger · security
 ```
 
-| Stage (`Jenkinsfile`) | Script | Fails the build on |
-|---|---|---|
-| Prepare | `build.sh --ensure-builder-only` | missing toolchain, bad parameter, builder/binfmt cannot start |
-| Lint | `lint.sh` | ruff findings · `bash -n` · YAML parse · secret-looking files in git |
-| Unit tests | `unit-tests.sh` (in `python:3.12-slim`) | any pytest failure, missing deps in strict mode |
-| Build & push | `build.sh --push` ×10 (capped fan-out) | build failure, `/health` not 200, missing manifest entry |
-| Trivy security gate | `scan.sh --mode gate` | HIGH/CRITICAL **with a released fix** (`.trivyignore` = accepted risk) |
-| Promote images | `build.sh --promote` | retag failure (registry-side `imagetools create`) |
-| GitOps bump | `gitops-bump.sh` | malformed `image:` block, push rejection, branch == base branch |
-| E2E smoke (opt-in) | `docker compose up` + `scripts/test.sh` | any cross-service flow regression |
-
-Three decisions worth knowing before you edit anything:
-
-1. **Candidate tag, then promote.** Builds push `<branch>-<sha>`; `latest` is only ever
-   written by the Promote stage, via a registry-side retag. A `latest` that skipped the
-   Trivy gate cannot exist, and `docker buildx imagetools create` means the promoted
-   bytes are exactly the scanned bytes.
-2. **CI never deploys.** The last act of a green build is a commit touching two YAML
-   lines per service (`image.repository`, `image.tag`). Phase 5's ArgoCD reconciles from
-   git, so a rollback is `git revert`, not "replay build #7".
-3. **Multi-arch is the default, `--load` is not.** buildx cannot load a manifest list, so
-   smoke tests run against a single-platform build and the *pushed* manifest list is
-   verified with `imagetools inspect` (both platforms or the build fails). QEMU/arm64
-   emulation is the slow part — `SKIP_MULTIARCH=1` buys a fast loop on feature branches.
-
-Agent setup, credentials, plugins, JCasC, webhooks, timings, and the failure table are in
-**[`jenkins/setup.md`](./jenkins/setup.md)**.
+Each subsystem has its own README: [`helm-charts/`](helm-charts/README.md),
+[`terraform/local-kind/`](terraform/local-kind/README.md),
+[`terraform/aws-graviton/`](terraform/aws-graviton/README.md),
+[`argocd/`](argocd/README.md), [`observability/`](observability/README.md).
 
 ---
 
-## 5. Roadmap — Phases 2-6 (Local → AWS)
+## 5. Continuous integration
 
-**How a phase lands** (same every phase, so "done" means one thing):
+Two pipelines, both deliberately boring: **declarative Jenkins only** — no `script { }`
+blocks, no fan-out, no Groovy logic. Every stage is **one** `sh` call into `scripts/ci/` or
+the Makefile, so the same commands run on your laptop and nothing needs debugging at 3 a.m.
+`scripts/ci/lib/check_jenkinsfile.py` fails the lint if a `script` block ever comes back.
 
-1. Work happens on the phase branch; nothing is committed straight to `main`.
-2. `make ci` green — the gate you can reproduce locally, not a badge on a page.
-3. `git push` the branch → open a PR against `main` with the stage/test/decision tables
-   and an honest "verified here / not verified here" section.
-4. Merge the PR (`gh pr merge --merge`, GitHub-side, matching how Phase 1 landed), then
-   fast-forward the phase branch onto `main` so the next phase starts from the merge commit.
+| Pipeline | Jenkins script path | Agent | What it does |
+|----------|--------------------|-------|--------------|
+| [`Jenkinsfile.local`](Jenkinsfile.local) | `Jenkinsfile.local` | `ecom-local` (docker, helm, kubectl, kind) | Build → deploy to Kind → verify. Nothing leaves the machine. |
+| [`Jenkinsfile.aws`](Jenkinsfile.aws) | `Jenkinsfile.aws` | `ecom-buildx` (docker, buildx + QEMU, trivy) | Multi-arch build → push → security gate → promote → GitOps commit. ArgoCD deploys. |
 
-A phase is not complete while its PR is open, and no phase is started on top of an
-unmerged previous one — Phase 4's charts must be able to assume Phase 2's bump contract
-exists in `main`, not just in a branch.
+**`Jenkinsfile.local` — build, deploy, verify**
 
+| Stage | Runs | Fails when |
+|-------|------|------------|
+| Prepare | `make doctor` | a required tool is missing |
+| Lint | `scripts/ci/lint.sh` | ruff findings, `bash -n`, YAML parse, secrets in git |
+| Unit tests | `scripts/ci/unit-tests.sh` | any pytest failure |
+| Build images | `scripts/ci/build.sh --push --registry localhost:5001` | build failure, missing manifest entry |
+| Smoke test | `smoke.sh` | an image that will not boot or answer `/health` |
+| Trivy scan | `scan.sh` (`TRIVY_INSECURE=1`: localhost:5001 is plain HTTP) | HIGH/CRITICAL with a released fix (`SCAN_GATE=true`; report-only by default locally) |
+| Deploy to Kind | `make helm-install-local IMAGE_TAG=…` (kubeconfig from `make -s kind-kubeconfig`) | a Helm release will not install |
+| Verify deployment | `kubectl wait --for=condition=Available` + `scripts/test.sh` | the rollout stalls, or the end-to-end flow breaks |
 
-### Phase 2: Jenkins CI — Pipeline-as-Code + Multi-arch ✅ COMPLETE
+**`Jenkinsfile.aws` — publish, then hand over to ArgoCD**
 
-Delivered (2026-09):
+| Stage | Runs | Fails when |
+|-------|------|------------|
+| Prepare | `make doctor`, buildx + QEMU, `docker login` | toolchain or registry credentials missing |
+| Lint · Unit tests | as above, in `python:3.12-slim` with every service's deps | as above |
+| Build & push | `build.sh --load` → `smoke.sh` → `build.sh --push` (amd64 + arm64, `retry(2)`) | build failure, `/health` not 200, push rejected |
+| Trivy security gate | `scan.sh --mode gate` against the pushed refs | HIGH/CRITICAL CVE **with a released fix** (`.trivyignore` = accepted risk) |
+| Promote images | `build.sh --promote --to latest` | registry-side retag failure |
+| GitOps bump | `gitops-bump.sh --push` → `gitops/main`, trunk builds only | malformed `image:` block, push rejected, branch == base branch |
 
-- `Jenkinsfile` — declarative, 8 stages, per-service fan-out with a concurrency cap,
-  `catchError` on scans so one finding does not cancel its siblings, `retry(2)` on push.
-- `scripts/ci/{lint,unit-tests,build,smoke,scan,gitops-bump,all}.sh` + `lib/` — every gate
-  is a script first, so laptop and CI agree by construction.
-- Multi-arch buildx for all 10 services (`linux/amd64,linux/arm64`), registry cache,
-  digest capture, and `imagetools` manifest verification. `python:3.12-slim` +
-  `psycopg2-binary` are wheel-clean on arm64, so no cross-toolchain is needed.
-- Trivy gate: HIGH/CRITICAL with `--ignore-unfixed`, per-image JSON + SARIF + JUnit, DB
-  warmed once before the fan-out, `.trivyignore` as an explicit accepted-risk register,
-  and a **hard failure when the binary is missing** (STRICT_TOOLS) instead of a silent skip.
-- GitOps trigger: `helm-charts/*/values.yaml` image block rewritten and pushed to
-  `gitops/main`, with `[skip ci]`, credential redaction, workspace restore, and refusal to
-  guess when a values file is hand-mangled.
-- `jenkins/setup.md` — plugins, JCasC, agent labels, Docker Hub + gitops credentials,
-  GitHub webhook, timings, first-build runbook, §9 failure table.
-- Tests as a CI gate: `tests/` structure tier (registry ↔ compose ↔ gateway routes ↔
-  Dockerfiles ↔ values stubs ↔ Jenkinsfile) and app tier (10 services probed via
-  TestClient with **no** Postgres/Redis/RabbitMQ, proving readiness probes will pass).
+Run any of it yourself — these are the same scripts, in the same order:
 
-Plan adjustments made during implementation, with reasons:
-- "3 stages" became 8: a security gate that runs *after* push cannot be a footnote in the
-  build stage, and the promote/bump split is what keeps `latest` trustworthy.
-- Image names/tags stay driven by `scripts/ci/lib/services.sh` — one registry, asserted
-  against Compose and the gateway map by tests rather than duplicated in YAML.
-- Added a smoke stage (run image → `/health` 200) between load and push: a Dockerfile that
-  builds but cannot boot is the most expensive class of failure to discover at 3 a.m.
-
-What this working environment proved, and what it could not:
-
-- **Proven here** (no docker daemon, no JVM): `make ci` end to end — 198 passing tests
-  (115 structure + 83 app), ruff over 55 modules, `bash -n` over 11 scripts, YAML/tab
-  parse, the Jenkinsfile checker, secrets hygiene. And the GitOps bump against a *real*
-  second writer: two clones pushing one bare remote, where disjoint bumps replay with no
-  lost tag and a conflicting tag is refused with the agent workspace restored
-  (`jenkins/setup.md` §9). `--dry-run` produced a `git apply`-clean patch for all ten charts.
-- **Needs the tools before it is believed**: `build.sh`, `smoke.sh`, `scan.sh` were never
-  executed — this sandbox has no buildx, no daemon and no trivy binary, so multi-arch
-  push, manifest-list verification and the CVE gate are unrun. Each exits **3**, never a
-  simulated pass, so a machine without them fails loudly.
-- **Loaded by Jenkins, not by us**: the `Jenkinsfile` cannot be parsed here, so it is
-  checked offline by `scripts/ci/lib/check_jenkinsfile.py` (delimiter balance, the stage
-  contract, and the two Groovy interpolation traps that parse fine and break at runtime).
-  The first real parse is step one of the runbook in `jenkins/setup.md` §8.
-
-**Local test:**
 ```bash
-docker buildx create --name multi --use          # build.sh does this, idempotently
-docker buildx build --platform linux/amd64,linux/arm64 -f services/product/Dockerfile services/product --tag test:multi --load
-# ↑ buildx refuses --load with two platforms; scripts/ci/build.sh narrows --load to the
-#   host arch and pushes the manifest list separately, which is why this is not the README path.
-make ci-plan && make ci-build && make ci-scan    # the supported local equivalents
+make ci              # lint + unit tests, no Docker required (fast pre-push gate)
+make ci-plan         # resolved build matrix: services × platforms × tags
+make ci-all          # every stage in order, on this machine (Jenkins parity)
+make ci-push REGISTRY=docker.io/mylab12345   # what Jenkinsfile.aws does
+make helm-install-local && ./scripts/test.sh # what Jenkinsfile.local does after that
+make gitops-dry      # preview the tag bump as a git-apply-able patch
 ```
 
-### Phase 3: Infrastructure as Code — Terraform ✅ COMPLETE
+### Five decisions worth knowing before you edit anything
 
-Delivered (2026-09):
+1. **Candidate tag, then promote.** The candidate tag is the 12-char git SHA, derived by
+   `build.sh` itself (with `-dirty` appended if the tree is not clean) — `scan.sh` and
+   `--promote` derive the same value, so it cannot drift between stages, and rebuilding a
+   commit is a no-op bump. `latest` is only ever written by the promote stage via
+   `docker buildx imagetools create`, so a `latest` that skipped the Trivy gate cannot exist
+   and the promoted bytes are exactly the scanned bytes.
+2. **The cloud pipeline never deploys.** `Jenkinsfile.aws` ends with a commit touching two YAML
+   lines per service (`image.repository`, `image.tag`) on `gitops/main`; ArgoCD reconciles, so a
+   rollback is `git revert`, not "replay build #7". A test fails the build if `kubectl`,
+   `helm upgrade` or `terraform apply` ever appears in that file. `Jenkinsfile.local` *does*
+   deploy, because a Kind cluster on your own machine is the point of it.
+3. **Multi-arch is the AWS default, `--load` is not.** buildx can't load a manifest list, so the
+   smoke test runs against a single-platform build while the pushed manifest list is verified
+   with `imagetools inspect`. QEMU/arm64 emulation is the slow part — `SKIP_MULTIARCH=1` buys a
+   fast loop on feature branches. The local pipeline builds amd64 only: Kind runs on your host.
+4. **Probes and healthchecks share one path.** `/health` in the Dockerfile, the readiness probe
+   in Helm, and the CI smoke stage are the same endpoint, so a container that boots locally
+   boots in the cluster.
+5. **Missing tools fail loudly.** No trivy binary exits 3 rather than silently skipping the
+   scan (`STRICT_TOOLS=1`). Nothing in either pipeline can fake a pass.
 
-**`terraform/local-kind/` — Local Kind + Registry Mirror**
-- `versions.tf`: Terraform 1.7+, providers kind ~>0.4, docker ~>3.0, kubernetes, helm
-- `variables.tf`: cluster_name ecom-local, k8s_version v1.29.2, ports 80/443/8080/5001, workers 2
-- `main.tf`: docker_image registry:2 + docker_container ecom-registry (port 5001) + kind_cluster 1 CP + 2 workers with extraPortMappings (80->80,443->443,8080->30080,30000->gateway) + containerdConfigPatches for localhost:5001 mirror + null_resource to connect registry to kind network + ConfigMap local-registry-hosting + Namespace ecom + optional ingress-nginx Helm release
-- `outputs.tf`: kubeconfig_path, endpoint, registry_endpoint localhost:5001, port mappings, next steps
-- Cost: free (laptop), matches AWS topology: critical label on CP, stateless on workers
+Agent setup, plugins, JCasC, credentials, webhooks, timings, and the failure table:
+[`jenkins/setup.md`](jenkins/setup.md).
 
-**`terraform/aws-graviton/` — EKS 1.29+ Graviton Spot (40% saving)**
-- `versions.tf`: Terraform 1.7+, aws ~>5.40, kubernetes ~>2.27, helm ~>2.13, tls ~>4.0, local backend (S3 example commented), IRSA via OIDC
-- `variables.tf`: region, project, env, cluster_name ecom-eks-graviton, cluster_version 1.29, vpc_cidr 10.0.0.0/16, az_count 3, graviton_instance_types ["m7g.medium","m6g.medium","m7g.large","m6g.large"], critical_instance_types ["m7g.large","m6g.large","m7g.xlarge"], enable_spot true, capacity_type SPOT/ON_DEMAND, ami_type AL2_ARM_64, disk 50, cost tags
-- `locals.tf`: common_tags (Project, Env, Cluster, ManagedBy, CostOpt), AZ slicing, auto CIDR calc
-- `vpc.tf`: terraform-aws-modules/vpc/aws ~>5.8 — public/private subnets across 3 AZs, NAT GW (single for dev, multi for prod), ELB tags `kubernetes.io/role/elb` + `internal-elb` + `karpenter.sh/discovery`, extra SG
-- `eks.tf`: terraform-aws-modules/eks/aws ~>20.17 — cluster 1.29+, endpoint public+private, enable_irsa true, addons coredns/kube-proxy/vpc-cni (prefix delegation)/ebs-csi-driver (IRSA), managed node groups: critical ON_DEMAND Graviton 2 desired (identity, order, payment, shipping, gateway) with labels workload=critical/arch=arm64/tier=critical, stateless_spot SPOT Graviton mixed 3 desired (product, inventory, cart, review, notification) with taint spot=true:NoSchedule + labels spot=true, IRSA roles for ebs-csi, cluster-autoscaler, aws-load-balancer-controller
-- `outputs.tf`: vpc_id, subnets, cluster_endpoint, oidc, node_groups, IRSA ARNs, kubeconfig command, cost_optimization summary (~40% saving), helm scheduling overrides
-- `terraform.tfvars.example`: dev example with single_nat_gateway true for cost
+---
 
-**Cost Optimization Table:**
-| Decision | Saving | Detail |
-|---|---|---|
-| Graviton m7g/m6g vs m7i/m6i | 20% cheaper + 15% perf/watt | ARM64, python:3.12-slim wheel-clean |
-| Spot stateless | 70% discount | product, inventory, cart, review, notification tolerate eviction |
-| ON_DEMAND critical | Safety | identity, order, payment, shipping, gateway no eviction mid-capture |
-| Mixed instance types | Availability | ["m7g.medium","m6g.medium","m7g.large","m6g.large"] diversification |
-| Total | ~40% vs x86 on-demand | capacity_type=SPOT, ami_type=AL2_ARM_64 |
+## 6. Deploying
 
-**Usage:**
 ```bash
-cd terraform/local-kind && terraform init && terraform apply
-export KUBECONFIG=$(terraform output -raw kubeconfig_path)
-kubectl get nodes -L workload -L arch
-
-cd ../aws-graviton && terraform init && terraform apply
-aws eks update-kubeconfig --region us-east-1 --name ecom-eks-graviton
-kubectl get nodes -L kubernetes.io/arch -L workload -L lifecycle
-```
-
-### Phase 4: K8s Orchestration — Helm Charts ✅ COMPLETE
-
-Delivered (2026-09):
-
-**`helm-charts/ecom-common/` — Library Chart**
-- Chart.yaml type library 0.1.0, templates/_helpers.tpl with 15 helpers: fullname, chart, selectorLabels, labels (app.kubernetes.io/* + eci.managed-by=jenkins-ci + eci.phase=4 + arch), serviceAccountName, image, probes.readiness/liveness (path /health same as Dockerfile HEALTHCHECK and Phase 2 smoke), resources (100m/128Mi requests, 500m/512Mi limits), nodeSelector (arch arm64), tolerations (spot=true:NoSchedule when spotCapable), topologySpreadConstraints (AZ + hostname), securityContext (non-root 1000, seccomp RuntimeDefault, drop ALL), env, priorityClassName, pdb. _probes.tpl extra.
-
-**10 Service Charts (identity, product, inventory, cart, order, payment, shipping, notification, review, gateway)**
-- Each: Chart.yaml with dependency file://../ecom-common, version 0.1.0 appVersion 1.0.0, annotations tier/port
-- values.yaml expanded but keeps image.repository + image.tag 2-space contract (Phase 2 test still green). Adds: nameOverride, fullnameOverride, service (ClusterIP port=targetPort=containerPort), serviceAccount create true, podSecurityContext runAsNonRoot 1000 fsGroup 1000 seccomp RuntimeDefault, securityContext drop ALL no priv escalation, resources, probes, metrics, config (SERVICE_NAME, LOG_LEVEL, downstream URLs via K8s DNS http://product:8002 etc, DATABASE_URL, REDIS_URL, RABBITMQ_URL), extraConfig/extraEnv/envSecrets, autoscaling enabled min 2 max 10 CPU 70% mem 80%, PDB minAvailable 1, scheduling architecture arm64 spotCapable (true stateless, false critical) priorityClass ecom-critical/best-effort, nodeSelector/tolerations/topologySpreadConstraints, ingress (gateway enabled /* → gateway:8080, others disabled but template ready), networkPolicy enabled, serviceMonitor disabled
-- templates/: _helpers.tpl (local copy of ecom-common helpers with __SVC__ replacement, fallback if library not updated), deployment.yaml (2 replicas RollingUpdate maxSurge 1 maxUnavailable 0, labels eci.service, annotations prometheus.io/scrape + checksum/config, serviceAccountName, securityContext, priorityClassName, terminationGracePeriod 30, nodeSelector, tolerations, topologySpreadConstraints, container image from helper, ports http containerPort, envFrom ConfigMap, env extraEnv + envSecrets, liveness/readiness probes, resources, securityContext), service.yaml (ClusterIP port targetPort), configmap.yaml (from values.config), hpa.yaml (autoscaling/v2 min 2 max 10 CPU+mem), serviceaccount.yaml, pdb.yaml (policy/v1 minAvailable 1), networkpolicy.yaml (ingress from gateway + ingress-nginx + prometheus, egress to kube-dns 53 + downstream deps matching topology: cart→product+redis, inventory→product+postgres, order→product+inventory+payment+cart+shipping+notification+postgres, etc.), ingress.yaml (gateway: /* Prefix rewrite /$2, others: /api/<svc>(|$)(.*) Prefix), NOTES.txt (port-forward, health, arch)
-
-**`helm-charts/ingress-nginx/` — Multi-arch Ingress**
-- Chart.yaml dependency ingress-nginx 4.10.0 from kubernetes.github.io, wrapper version 0.1.0 appVersion 1.10.0
-- values.yaml: controller replica 2, image registry.k8s.io/ingress-nginx/controller:v1.10.0 multi-arch (no amd64-only digest), service LoadBalancer with AWS NLB annotations (external, ip target, internet-facing, cross-zone), hostPort disabled for EKS (enabled for Kind override), watchIngressWithoutClass true, ingressClassResource nginx default true, resources 100m/256Mi req 1000m/1024Mi lim, autoscaling 2-6 CPU 70% mem 80%, topologySpreadConstraints AZ, config proxy-connect 10 proxy-read 60 proxy-send 60 proxy-body-size 10m proxy-buffering on hsts false use-forwarded-headers true log-format-upstream includes $req_id, metrics enabled serviceMonitor false, nodeSelector arm64, tolerations [], priorityClassName ecom-critical, minAvailable 1, defaultBackend disabled
-- values-kind.yaml: service NodePort + hostPort 80/443, nodeSelector linux only, resources smaller
-- values-eks.yaml: service LoadBalancer NLB, nodeSelector arm64, resources larger, autoscaling 2-10
-- templates/NOTES.txt: verify controller, LB hostname, Kind curl, gateway entrypoint, ARM64 note
-
-**`helm-charts/network-policies/` — Security**
-- Chart.yaml 0.1.0, values.yaml with image contract placeholder + enabled true + defaultDeny enabled policyTypes Ingress/Egress + allowDNS enabled + gateway enabled port 8080 from ingress-nginx + ipBlock 0.0.0.0/0 except 169.254.0.0/16 + edges map (identity 8001 from gateway, product 8002 from gateway+inventory+cart+order+review, etc.) + infra postgres 5432 clients 8 services, redis 6379 clients cart, rabbitmq 5672 clients notification+order
-- templates: _helpers.tpl, default-deny.yaml (podSelector {} policyTypes Ingress+Egress), allow-dns.yaml (egress to kube-system k8s-app kube-dns 53 UDP+TCP), gateway-ingress.yaml (podSelector gateway ingress from ingress-nginx controller + gateway + 0.0.0.0/0 port 8080), service-edges.yaml (range edges, per svc NetworkPolicy from gateway or specific clients port), infra-edges.yaml (range infra, per infra allow from clients port), NOTES.txt (list policies, topology, verify commands)
-
-**Helm Usage:**
-```bash
-helm lint helm-charts/product
-helm template ecom helm-charts/product -n ecom | kubectl apply --dry-run=client -f -
-helm dependency update helm-charts/product
-make helm-lint && make helm-template
-
-# Kind
-terraform -chdir=terraform/local-kind apply
+# local Kind cluster + registry mirror on :5001 (free, mirrors the AWS topology)
+make kind-up
 export KUBECONFIG=$(terraform -chdir=terraform/local-kind output -raw kubeconfig_path)
-helm upgrade --install product ./helm-charts/product -n ecom --set image.repository=localhost:5001/ecom-product --set image.tag=local
-helm upgrade --install gateway ./helm-charts/gateway -n ecom --set image.repository=localhost:5001/ecom-gateway --set image.tag=local
-helm upgrade --install ingress-nginx ./helm-charts/ingress-nginx -n ingress-nginx --create-namespace -f helm-charts/ingress-nginx/values-kind.yaml
-helm upgrade --install network-policies ./helm-charts/network-policies -n ecom
 
-# EKS
-aws eks update-kubeconfig --region us-east-1 --name ecom-eks-graviton
-helm upgrade --install network-policies ./helm-charts/network-policies -n ecom --create-namespace
-helm upgrade --install ingress-nginx ./helm-charts/ingress-nginx -n ingress-nginx --create-namespace -f helm-charts/ingress-nginx/values-eks.yaml
-for svc in identity product inventory cart order payment shipping notification review gateway; do helm upgrade --install $svc ./helm-charts/$svc -n ecom --set image.tag=$(git rev-parse --short HEAD); done
-kubectl get pods -n ecom -l eci.phase=4 -L eci.service -L kubernetes.io/arch
+# AWS EKS on Graviton (needs AWS credentials)
+make tf-plan-eks && make tf-apply-eks && make eks-kubeconfig
+
+# validate charts without a cluster, then install
+make helm-lint && make helm-template
+make helm-install-local && kubectl get pods -n ecom -l eci.phase=4 -L kubernetes.io/arch
+
+# GitOps: install ArgoCD, bootstrap App-of-Apps, watch it reconcile
+make argocd-install && make argocd-apps && make argocd-status
+make argocd-admin-pass     # initial admin password
+kubectl port-forward svc/argocd-server -n argocd 8081:80   # 8081: the gateway owns 8080 locally
 ```
 
-- Each chart: deployment (2 replicas, probes, resources), service (ClusterIP), ingress route `/api/<svc>`, NetworkPolicy, HPA.
-- Gateway: Ingress `/*` → gateway:8080.
+Each chart ships a Deployment (2 replicas, rolling update, probes, resource limits, non-root
+security context), Service, ConfigMap, HPA (2–10), PDB, NetworkPolicy, and an ingress route at
+`/api/<service>`; the gateway owns `/*`. NetworkPolicies default-deny and open only the edges
+in the service topology — cart can reach product and Redis, order can reach everything it
+orchestrates, nothing else can.
 
-### Phase 5: GitOps — ArgoCD ✅ COMPLETE
+Runbook for credentials, webhooks (<2 s sync), and audit-clean rollback:
+[`argocd/setup.md`](argocd/setup.md).
 
-Delivered (2026-09):
+### Cost posture on AWS
 
-- `argocd/projects/ecom.yaml` — `AppProject` CR scoping RBAC and isolating deployments:
-  - Allowed repositories: `https://github.com/mylab12345/Ecom-Site-Devops.git`
-  - Destination namespaces: `ecom`, `ingress-nginx`, `observability`
-  - Prevents accidental writes or escalations to `kube-system`.
-- `argocd/applications/*.yaml` — Individual `Application` CR for all 10 services plus platform ingress-nginx & network-policies:
-  - Tracks `targetRevision: gitops/main` and path `helm-charts/<svc>`
-  - Automated sync policy with `selfHeal: true`, `prune: true` (foreground deletion), and exponential backoff retry.
-- `argocd/applicationset.yaml` — Declarative `ApplicationSet` using list generator for all 10 microservices driven by the service registry.
-- `argocd/root-app.yaml` — Root App-of-Apps `Application` resource synchronizing all applications declaratively.
-- `argocd/setup.md` — Complete production runbook: installation, credentials (`argocd-initial-admin-secret`, `gitops-token`), GitHub Webhook configuration (<2s sync), and audit-clean rollback runbook (`git revert`).
-- Invariant: CI never touches the cluster (`kubectl`/`helm`); Jenkins only commits image tags to `gitops/main`, and ArgoCD reconciles.
+| Decision | Effect |
+|----------|--------|
+| Graviton `m7g`/`m6g` instead of `m7i`/`m6i` | ~20% cheaper, ~15% better perf/watt |
+| Spot for stateless (product, inventory, cart, review, notification) | ~70% discount, eviction-tolerant |
+| On-demand for critical (identity, order, payment, shipping, gateway) | no eviction mid-capture |
+| Mixed instance types per node group | capacity availability |
+| **Net** | **~40% below x86 on-demand** (`enable_spot`, `graviton_only` toggles) |
 
-**Usage:**
+All images are `python:3.12-slim` — wheel-clean on both amd64 and arm64, so no cross-toolchain.
+
+---
+
+## 7. Observability and security
+
 ```bash
-# Bootstrap ArgoCD and all applications
-make argocd-install
-make argocd-apps
-make argocd-status
+make obs-up        # Jaeger + kube-prometheus-stack + Grafana + Loki/Promtail + security
+make obs-down      # tear it all down
+make trivy-scan-cluster   # run the nightly scan now
 ```
 
-### Phase 6: Observability & Security ✅ COMPLETE
+- **Metrics/alerts** — `ServiceMonitor`s discover all ten services; `PrometheusRule`s fire on
+  5xx > 1%, p99 > 1 s, instance down, payment failure spike, crash-looping pods.
+- **Dashboards** — provisioned Grafana: platform overview (RPS, error rate, p50/p90/p99),
+  per-service deep dive with a `$service` selector, and business SLOs (payment success 99.9%,
+  availability 99.95%, order velocity). Login `admin` / `ecom-grafana-secure-admin`.
+- **Logs** — Loki (TSDB v13, 7-day retention) with a Promtail DaemonSet indexing `service`,
+  `level`, and `X-Request-ID`.
+- **Traces** — Jaeger all-in-one (UI 16686, OTLP 4317/4318) with W3C `traceparent` and
+  `X-Request-ID` propagated from the gateway.
+- **Security** — nightly in-cluster Trivy CronJob at 02:00 UTC over running workloads, scoped
+  read-only RBAC, and Pod Security Standards (`baseline` enforced, `restricted` audited).
 
-Delivered (2026-09):
-
-- **Prometheus & Alerting** (`observability/prometheus/`):
-  - `kube-prometheus-stack-values.yaml`: Production Helm values targeting ARM64 Graviton nodes, 15-day retention, custom scrape configurations for annotated pods (`prometheus.io/scrape: "true"`).
-  - `rules/ecom-alerts.yaml`: `PrometheusRule` CR defining production alerts: `EcomServiceHighErrorRate` (5xx > 1%), `EcomServiceHighLatencyP99` (>1s), `EcomServiceInstanceDown`, `EcomPaymentFailureSpike`, and `EcomPodCrashLooping`.
-  - `servicemonitors/ecom-servicemonitors.yaml`: `ServiceMonitor` discovering all 10 microservices in namespace `ecom`.
-- **Grafana Dashboards** (`observability/grafana/`):
-  - `datasources.yaml` & `dashboards-provisioning.yaml`: Automated provider provisioning for Prometheus, Loki, and Jaeger.
-  - `dashboards/ecom-overview.json`: Executive and operations dashboard (Total RPS, 5xx error rate %, p50/p90/p99 latency, active pods, status code breakdown, container memory).
-  - `dashboards/service-detail.json`: Parameterized deep-dive with `$service` selector, endpoint-level throughput, latency percentiles, CPU cores, and memory usage.
-  - `dashboards/ecom-business-slo.json`: Business KPIs and SLO tracking: Payment Success Rate SLO (99.9%), System Availability SLO (99.95%), Order Creation Velocity, and payment status distribution.
-- **Log Aggregation** (`observability/loki/`):
-  - `loki-values.yaml`: Production Loki configuration with TSDB v13 schema, filesystem/S3 chunk storage, and 7-day retention.
-  - `promtail-values.yaml`: DaemonSet extracting structured log fields (`%(asctime)s %(levelname)s %(name)s %(message)s`) and indexing `service`, `level`, and `X-Request-ID`.
-- **Distributed Tracing** (`observability/jaeger/`):
-  - `jaeger-all-in-one.yaml`: Deployment and Services exposing Jaeger UI (port 16686) and OTLP collectors (gRPC 4317, HTTP 4318).
-  - W3C Trace Context (`traceparent`) & `X-Request-ID` propagation from API Gateway across microservices.
-  - `otel-collector-config.yaml`: OpenTelemetry collector pipeline.
-- **Cluster Security & Vulnerability Scanning** (`observability/security/`):
-  - `trivy-cronjob.yaml`: In-cluster Kubernetes `CronJob` running nightly at `02:00 UTC` (`aquasec/trivy:0.50.0`) scanning all running workloads in `ecom` namespace for `HIGH,CRITICAL` CVEs.
-  - `rbac.yaml`: Scoped read-only ServiceAccount and ClusterRole for Trivy.
-  - `pod-security-standards.yaml`: Pod Security Standards enforcing `baseline` and auditing `restricted`.
-
-**Usage:**
 ```bash
-# Deploy full observability & security stack
-make obs-up
-
-# Access dashboards & interfaces
-make obs-prometheus
-make obs-jaeger
+kubectl port-forward -n observability svc/kube-prometheus-stack-grafana 3000:80
+kubectl port-forward -n observability svc/kube-prometheus-stack-prometheus 9090:9090
+kubectl port-forward -n observability svc/jaeger-all-in-one 16686:16686
 ```
 
----
-
-## 6. Stable Versions (Phases 1-6)
-
-| Tool | Version |
-|------|---------|
-|Python|3.12 (python:3.12-slim)|
-|FastAPI|0.110.2|
-|Uvicorn|0.29.0 (standard)|
-|SQLAlchemy|2.0.30|
-|psycopg2-binary|2.9.9|
-|Pydantic|2.7.1|
-|httpx|0.27.0|
-|Redis|7-alpine|
-|Postgres|15-alpine|
-|RabbitMQ|3-management-alpine|
-|Terraform|1.7+ ✅ (1.7.0 required, modules vpc ~>5.8, eks ~>20.17)|
-|K8s|1.29+ ✅ (Kind v1.29.2, EKS 1.29)|
-|Helm|3.14+ ✅ (charts apiVersion v2, 13 charts linted)|
-|Kind|0.22+ ✅ (1 CP + 2 workers, registry mirror)|
-|ingress-nginx|4.10.0 ✅ (controller v1.10.0 multi-arch)|
-|ArgoCD|v2.10.4+ ✅ (AppProject, ApplicationSet, App-of-Apps)|
-|Prometheus|v2.51+ ✅ (kube-prometheus-stack ~58.0, Graviton ARM64)|
-|Grafana|v10.4+ ✅ (3 production dashboards, auto-provisioned)|
-|Loki / Promtail|v2.9+ ✅ (TSDB v13, structured JSON/CRI parsing)|
-|Jaeger|v1.57+ ✅ (OTLP gRPC 4317/HTTP 4318, UI 16686)|
-|Trivy|0.50+ ✅ (CI gate + nightly in-cluster CronJob 02:00 UTC)|
-|Jenkins|2.440.3 LTS ✅|
-|Docker buildx|0.14+ ✅ (docker-container driver for multi-arch)|
-|hadolint / shellcheck|latest ✅ (advisory in `lint.sh`)|
-|ruff / pytest|0.16.8 / 9.1.1 ✅ pinned in `requirements-dev.txt`|
-
-All Dockerfiles use `python:3.12-slim` — **ARM64 & AMD64 compatible** (no arch-specific wheels). `docker buildx` covers Graviton.
+Details: [`observability/README.md`](observability/README.md).
 
 ---
 
-## 7. Inter-Service Communication (DNS)
+## 8. Pinned versions
 
-All calls use internal DNS: `http://<service-name>:<port>/<path>` where service-name == Compose service & K8s Service. Examples:
-
-- `http://product:8002/products/1`
-- `http://inventory:8003/inventory/1`
-- `http://order:8005/orders`
-- Gateway maps `/api/products` → `http://product:8002/products` (strip `/api`).
-
-See `services/gateway/app/config.py` `settings.services` and `services/order/app/config.py`, etc. In K8s it becomes `http://product.ecom.svc.cluster.local:8002`.
-
-**Retry:** gateway retries 3× with backoff; order service releases reservation on failure.
-
----
-
-## 8. Cost Optimization (AWS Graviton)
-
-- **Graviton (ARM64)** m7g/m6g vs m7i/m6i — 20% cheaper, 15% better perf per watt.
-- **Spot** for stateless services (product, inventory, cart, review, gateway: 70% discount; order/payment/shipping on-demand or spot-with-fallback).
-- Single Postgres for local; AWS RDS Graviton or Aurora Serverless v2 in prod (not in Compose).
-- Terraform toggles: `enable_spot = true`, `graviton_only = true`.
+| Layer | Versions |
+|-------|----------|
+| App | Python 3.12 (`python:3.12-slim`), FastAPI 0.110.2, Uvicorn 0.29.0, SQLAlchemy 2.0.30, Pydantic 2.7.1, httpx 0.27.0, psycopg2-binary 2.9.9 |
+| Data | Postgres 15-alpine, Redis 7-alpine, RabbitMQ 3-management-alpine |
+| CI | Jenkins 2.440.3 LTS, buildx 0.14+, Trivy 0.50+, hadolint/shellcheck, ruff 0.16.8, pytest 9.1.1 |
+| Infra | Terraform 1.7+ (vpc ~> 5.8, eks ~> 20.17), Kind 0.22+, Kubernetes 1.29, Helm 3.14+, ingress-nginx 4.10.0 |
+| GitOps / obs | ArgoCD v2.10.4+, kube-prometheus-stack ~58.0, Grafana v10.4+, Loki/Promtail v2.9+, Jaeger v1.57+ |
 
 ---
 
 ## 9. Troubleshooting
 
-See [troubleshooting.md](./troubleshooting.md) for microservice connectivity & ARM64 build issues. TL;DR:
+Full guide: [`troubleshooting.md`](troubleshooting.md) (connectivity and ARM64 deep dive).
 
-- `gateway 502` → downstream not ready — `docker compose ps` & `curl localhost:800x/health`
-- `pg_isready` fail → `docker compose logs postgres`, delete volume `docker compose down -v`
-- `exec format error` on ARM → rebuild with `docker buildx --platform linux/amd64,linux/arm64`
-- Order fails with 409 → inventory `available` < requested — adjust via `/api/inventory/{id}/adjust`
-
----
-
-## 10. Next Action — Full Platform Lifecycle
-
-All 6 phases are complete and production-grade:
-
-```bash
-# Phase 1: Local Docker Compose Stack
-make up && make health && ./scripts/test.sh
-
-# Phase 2: Local CI Gate (Lint, 214 Tests, Build Plan, Scan)
-make ci && make ci-plan
-
-# Phase 3: Infrastructure Provisioning (Kind Local or AWS Graviton EKS)
-make tf-plan-local && make kind-up            # Local Kind + Registry
-# or: make tf-plan-eks && make tf-apply-eks   # AWS Graviton EKS
-
-# Phase 4: Helm Charts Validation & Rendering
-make helm-lint && make helm-template
-make helm-install-local && kubectl get pods -n ecom -l eci.phase=4
-
-# Phase 5: ArgoCD GitOps Continuous Delivery
-make argocd-install && make argocd-apps
-make argocd-status
-
-# Phase 6: Full Observability & Security Stack
-make obs-up
-```
-
-Open:
-- `http://localhost:8080/docs` — API Gateway Swagger UI
-- `http://localhost:8080/health` — Gateway Aggregated Health (all 10 services)
-- `http://localhost:3000` — Grafana Dashboards (admin / ecom-grafana-secure-admin)
-- `http://localhost:9090` — Prometheus Query & Alerting
-- `http://localhost:16686` — Jaeger Distributed Tracing UI
-- `http://localhost:8080` (port-forward `argocd-server`) — ArgoCD Web Console
-- `http://localhost:15672` — RabbitMQ Management UI
+| Symptom | Fix |
+|---------|-----|
+| Gateway returns 502 | A downstream isn't ready — `docker compose ps`, then `curl localhost:800x/health` |
+| `pg_isready` keeps failing | `docker compose logs postgres`; wipe with `docker compose down -v` |
+| `exec format error` on ARM | Rebuild both platforms: `docker buildx --platform linux/amd64,linux/arm64` |
+| Order fails with 409 | Inventory `available` < requested — `POST /api/inventory/{id}/adjust` |
+| `make ci-*` exits 3 | A required tool is missing on purpose — run `make doctor` |
 
 ---
 
-Made with ❤️ for Local-First DevOps. Graviton-ready. All 6 Phases Complete.
+Built local-first: if it doesn't run on a laptop, it doesn't ship.
