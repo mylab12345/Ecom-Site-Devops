@@ -87,6 +87,12 @@ fi
 
 ORIG_HEAD="$(git rev-parse HEAD)"
 SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+# An agent usually has no global git identity, and the bump runs as whoever owns the
+# workspace. Pass it per-command instead of writing repo config: the next build reuses
+# this directory and must not inherit a bot's git settings. Note this is required by
+# `rebase` too — that one has no -c of its own and dies with "empty ident name" if you
+# only fix the commit.
+GIT_ID=(-c "user.name=${GIT_AUTHOR_NAME:-ecom-ci}" -c "user.email=${GIT_AUTHOR_EMAIL:-ecom-ci@localhost}")
 MSG_SUBJECT="chore(gitops): bump image tags for $SHORT_SHA"
 MSG="Automated image tag bump from Jenkins build #${BUILD_NUMBER:-local}.
 
@@ -97,6 +103,15 @@ ArgoCD syncs these values; no deploy step runs in CI.
 [skip ci]"
 
 redact() { sed -E 's#(://)[^/@[:space:]]+@#\1***@#g'; }
+
+restore_workspace_after_failure() {
+  # A rejected push must not leave the agent parked on an unpushed commit: the next
+  # build would inherit it and attribute that bump to its own SHA.
+  [[ "${GITOPS_RESET_AFTER_PUSH:-1}" == "1" ]] || return 0
+  git reset -q --hard "$ORIG_HEAD" 2>/dev/null || ecom_ci_warn "workspace reset failed (harmless if the job cleans the workspace)"
+  git clean -fdq -- "$CHARTS_DIR" 2>/dev/null || true
+  ecom_ci_log "workspace restored to $SHORT_SHA"
+}
 
 # --- 1. rewrite values files ------------------------------------------------
 BUMP_LOG="$ECI_OUT_DIR/gitops-bump.md"
@@ -166,9 +181,8 @@ git --no-pager diff -- "$CHARTS_DIR" | head -n 120
 
 # --- 3. commit ---------------------------------------------------------------
 git add -- "${CHANGED[@]}" || eci_die "git add failed"
-git -c user.name="${GIT_AUTHOR_NAME:-ecom-ci}" \
-    -c user.email="${GIT_AUTHOR_EMAIL:-ecom-ci@localhost}" \
-    commit -q -m "$MSG_SUBJECT" -m "$MSG" || eci_die "git commit failed (hooks? signing? dirty index?)"
+git "${GIT_ID[@]}" commit -q -m "$MSG_SUBJECT" -m "$MSG" \
+  || { restore_workspace_after_failure; eci_die "git commit failed (hooks? signing? dirty index?)"; }
 NEW_HEAD="$(git rev-parse HEAD)"
 ecom_ci_ok "committed $NEW_HEAD ($BRANCH)"
 ecom_ci_summary "📝 gitops commit \`$(git rev-parse --short=7 HEAD)\` → ${#CHANGED[@]} values file(s)"
@@ -184,36 +198,43 @@ if [[ "$DO_PUSH" == "1" ]]; then
   [[ -n "$remote_url" ]] || { ecom_ci_err "remote '$REMOTE' has no URL — set GIT_REMOTE_URL or add a remote"; exit 3; }
   ecom_ci_log "pushing HEAD → $(printf '%s' "$remote_url" | redact) : refs/heads/$BRANCH"
 
-  # Network/registry blips are what `retry` is for; a *rejected* push is different —
-  # it means $BRANCH moved under us. The job runs disableConcurrentBuilds(), so the
-  # usual author of that move is a build of another branch (or a human) writing the
-  # same gitops branch. Rebase once and retry, because our change is a deterministic
-  # rewrite of image.tag: replaying it is always safe, and a conflict on it means two
-  # builds disagreed about the tag — exactly the case a human must see.
+  # A network blip is what `retry` is for; a *rejected* push is different — $BRANCH
+  # moved under us. The job runs disableConcurrentBuilds(), so the usual author of that
+  # move is another branch's build (or a human) writing the same gitops branch. Replay
+  # once: our change is a deterministic rewrite of image.tag, so rebasing it is safe,
+  # and a conflict on it means two builds disagreed about a tag — the one outcome a
+  # human has to see. Never auto-resolved.
   if ! ecom_ci_retry 3 git push -q "$REMOTE" "HEAD:refs/heads/$BRANCH"; then
+    pushed=0
     if git fetch -q "$REMOTE" "$BRANCH" 2>/dev/null; then
       ecom_ci_warn "push rejected — replaying the bump on top of $REMOTE/$BRANCH"
-      if git rebase -q FETCH_HEAD; then
+      rebase_log="$(ecom_ci_out gitops-rebase.log)"
+      # --autostash: an agent workspace is never perfectly clean (earlier stages touch
+      # files too) and `rebase` refuses to run over unstaged changes. Whatever gets
+      # stashed here is disposable — the workspace reset at the end owns it either way.
+      if git "${GIT_ID[@]}" rebase -q --autostash FETCH_HEAD > "$rebase_log" 2>&1; then
         if ecom_ci_retry 3 git push -q "$REMOTE" "HEAD:refs/heads/$BRANCH"; then
-          ecom_ci_ok "pushed refs/heads/$BRANCH (after rebase onto the newer head)"
-          ecom_ci_summary "🚀 pushed \`$BRANCH\` after replaying on top of a newer bump"
-          DO_PUSH_OK=1
+          ecom_ci_ok "pushed refs/heads/$BRANCH (after replay onto the newer head)"
+          pushed=1
         fi
       else
-        git rebase --abort || true
-        ecom_ci_err "two bumps touched the same image.tag — refusing to guess which build owns it"
+        git rebase --abort >/dev/null 2>&1 || true
+        ecom_ci_err "rebase onto $REMOTE/$BRANCH failed — most likely two bumps touched the same image.tag; refusing to guess which build owns it"
+        sed -n '1,20p' "$rebase_log" >&2 || true
       fi
     fi
-    if [[ "${DO_PUSH_OK:-0}" != "1" ]]; then
+    if [[ "$pushed" != "1" ]]; then
       ecom_ci_err "push rejected — branch protection, missing credentials, or a stale workspace?"
       ecom_ci_err "  hint: grant the Jenkins credential 'gitops-token' write access (jenkins/setup.md §6)"
       ecom_ci_err "  manual recovery: git fetch origin $BRANCH && git rebase FETCH_HEAD && git push origin HEAD:refs/heads/$BRANCH"
+      restore_workspace_after_failure
       exit 1
     fi
   fi
   ecom_ci_ok "pushed refs/heads/$BRANCH"
   ecom_ci_summary "🚀 pushed \`$BRANCH\` — ArgoCD will sync within its poll interval"
 fi
+
 
 # --- 5. optional PR ----------------------------------------------------------
 if [[ "$DO_PR" == "1" ]]; then
@@ -241,8 +262,6 @@ fi
 # --- 6. leave the workspace exactly as we found it ---------------------------
 # Jenkins reuses workspaces; a stray commit or modified chart would confuse the
 # next build's `git rev-parse`. Reset only after a successful push.
-if [[ "$DO_PUSH" == "1" && "${GITOPS_RESET_AFTER_PUSH:-1}" == "1" ]]; then
-  git reset --hard -q "$ORIG_HEAD" || ecom_ci_warn "workspace reset failed (harmless if the job cleans the workspace)"
-  git clean -fdq -- "$CHARTS_DIR" 2>/dev/null || true
-  ecom_ci_log "workspace restored to $SHORT_SHA"
+if [[ "$DO_PUSH" == "1" ]]; then
+  restore_workspace_after_failure
 fi

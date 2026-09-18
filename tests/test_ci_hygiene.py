@@ -334,18 +334,28 @@ def test_makefile_exposes_ci_targets():
 
 
 def test_gitops_bump_recovers_from_a_rejected_push():
-    """`values.yaml` is written by exactly one job, but that is not the only writer of
-    the branch (another branch's build, or a human). If the push is rejected the script
-    must replay the bump — our rewrite of image.tag is deterministic, so rebasing is
-    safe — and must NOT auto-resolve a conflict on it: two builds disagreeing about a
-    tag is the one outcome a human has to see."""
+    """`values.yaml` has one writer per job, but not one writer per branch. When the
+    push is rejected the script must replay the bump (our rewrite of image.tag is
+    deterministic, so rebasing is safe) and must NOT auto-resolve a conflict on it:
+    two builds disagreeing about a tag is the one outcome a human has to see.
+
+    The identity assertions are not pedantry — `git commit` in this script carries
+    `-c user.*` because agents have no global identity, and a `rebase` that forgets it
+    dies with "empty ident name" in the recovery path, i.e. only when two builds raced.
+    """
     text = (CI_DIR / "gitops-bump.sh").read_text(encoding="utf-8")
     assert "git push" in text, "bump must push HEAD:refs/heads/$GITOPS_BRANCH"
-    assert "git fetch -q \"$REMOTE\" \"$BRANCH\"" in text, "a rejected push must first fetch the moved branch"
-    assert "git rebase -q FETCH_HEAD" in text, "…then replay the bump on top of it"
+    assert 'git fetch -q "$REMOTE" "$BRANCH"' in text, "a rejected push must first fetch the moved branch"
+    assert 'git "${GIT_ID[@]}" rebase -q --autostash FETCH_HEAD' in text, (
+        "…then replay the bump on top of it, with the bot identity, and --autostash because "
+        "`rebase` refuses to run over an agent workspace that is not perfectly clean"
+    )
     assert "git rebase --abort" in text, "a conflict must abort, not leave the agent mid-rebase for the next build"
     assert "refusing to guess" in text, "the conflict message must name the decision a human owns"
-
+    # the recovery path runs on an agent whose workspace now holds an unpushed commit
+    assert text.count("restore_workspace_after_failure") >= 3, (
+        "commit failure, push failure and the success tail must all put the workspace back"
+    )
 
 def test_gitignore_excludes_ci_artifacts_and_keeps_dockerignore():
     text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
