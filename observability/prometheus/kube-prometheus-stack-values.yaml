@@ -1,0 +1,158 @@
+# kube-prometheus-stack Helm values — Production (Graviton ARM64 ready)
+# Compatible with prometheus-community/kube-prometheus-stack ~>58.0.0
+
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: false  # managed in EKS
+    general: true
+    k8s: true
+    kubeApiserver: true
+    kubeApiserverAvailability: true
+    kubePrometheusGeneral: true
+    kubeStateMetrics: true
+    node: true
+    prometheus: true
+
+global:
+  rbac:
+    create: true
+
+prometheusOperator:
+  enabled: true
+  image:
+    tag: v0.73.2
+  nodeSelector:
+    kubernetes.io/arch: arm64
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
+prometheus:
+  enabled: true
+  prometheusSpec:
+    serviceAccountName: kube-prometheus-stack-prometheus
+    retention: 15d
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+    ruleNamespaceSelector: {}
+
+    nodeSelector:
+      kubernetes.io/arch: arm64
+    tolerations:
+      - key: "spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2048Mi
+
+    # Scrape pods annotated with prometheus.io/scrape: "true"
+    additionalScrapeConfigs:
+      - job_name: "kubernetes-pods-annotated"
+        scrape_interval: 15s
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - ecom
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    nodeSelector:
+      kubernetes.io/arch: arm64
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'namespace', 'service']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: 'null'
+      routes:
+        - match:
+            alertname: Watchdog
+          receiver: 'null'
+        - match_re:
+            service: ^ecom-.*$
+          receiver: 'null'
+    receivers:
+      - name: 'null'
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+  nodeSelector:
+    kubernetes.io/arch: arm64
+
+grafana:
+  enabled: true
+  adminPassword: "ecom-grafana-secure-admin"
+  nodeSelector:
+    kubernetes.io/arch: arm64
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
+      searchNamespace: ALL

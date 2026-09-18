@@ -1,0 +1,75 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ecom-alert-rules
+  namespace: observability
+  labels:
+    app.kubernetes.io/part-of: ecom
+    release: kube-prometheus-stack
+    role: alert-rules
+    eci.phase: "6"
+spec:
+  groups:
+    - name: ecom-services.rules
+      rules:
+        # Alert if HTTP 5xx errors exceed 1% over 5m
+        - alert: EcomServiceHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{status=~"5.."}[5m])) by (endpoint, job)
+            /
+            sum(rate(http_requests_total[5m])) by (endpoint, job) * 100 > 1
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "High HTTP 5xx error rate on {{ $labels.endpoint }}"
+            description: "Service endpoint {{ $labels.endpoint }} is experiencing >1% 5xx error rate over the last 5 minutes (current value: {{ $value | printf \"%.2f\" }}%)."
+
+        # Alert if p99 latency exceeds 1 second
+        - alert: EcomServiceHighLatencyP99
+          expr: |
+            histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint)) > 1.0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Elevated p99 latency on {{ $labels.endpoint }}"
+            description: "99th percentile response time for {{ $labels.endpoint }} is above 1s (current value: {{ $value | printf \"%.2f\" }}s)."
+
+        # Alert if any microservice instance is down
+        - alert: EcomServiceInstanceDown
+          expr: |
+            up{kubernetes_namespace="ecom"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Pod instance down in ecom namespace"
+            description: "Instance {{ $labels.instance }} (pod {{ $labels.kubernetes_pod_name }}) in ecom namespace is unreachable."
+
+        # Alert if Payment service errors exceed threshold
+        - alert: EcomPaymentFailureSpike
+          expr: |
+            sum(rate(http_requests_total{endpoint=~".*payments.*",status=~"5.."}[5m])) > 0.1
+          for: 3m
+          labels:
+            severity: critical
+            team: payments
+          annotations:
+            summary: "Payment transaction failure spike detected"
+            description: "Payment service is failing transactions at rate {{ $value }} failures/sec over 3m."
+
+        # Alert if Pod restarts are increasing rapidly
+        - alert: EcomPodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="ecom"}[15m]) > 3
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Pod crash loop detected in ecom namespace"
+            description: "Pod {{ $labels.pod }} container {{ $labels.container }} restarted more than 3 times in 15 minutes."

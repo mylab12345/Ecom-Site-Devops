@@ -175,7 +175,21 @@ docker network inspect ecom-network | grep -A 2 '"Name"'
 
 ---
 
-## 5. Clean Reset
+## 5. Phase 5 & 6 Diagnostics (ArgoCD & Observability)
+
+| Issue | Cause | Fix |
+|---|---|---|
+| ArgoCD app `OutOfSync` | `gitops/main` bumped but not yet reconciled | Run `argocd app sync ecom-<svc> --prune` or check GitHub webhook status |
+| ArgoCD `ComparisonError` | Chart dependency missing | Run `helm dependency update helm-charts/<svc>` and check `Chart.yaml` |
+| ArgoCD `Degraded` | Pod crashloop or probe failure | Run `kubectl describe pod -l eci.service=<svc> -n ecom` |
+| Grafana shows "No Data" | Prometheus datasource URL or ServiceMonitor mismatch | Verify `http://kube-prometheus-stack-prometheus.observability:9090` and `kubectl get servicemonitor -n observability` |
+| Promtail logs not reaching Loki | Namespace/pod label selector mismatch | Check Promtail DaemonSet logs: `kubectl logs -n observability -l app.kubernetes.io/name=promtail --tail=100` |
+| Jaeger traces missing spans | Services not reaching collector | Check OTLP endpoint `http://jaeger-collector.observability:4318` and ensure NetworkPolicy permits egress |
+| Nightly Trivy scan failure | ClusterRole RBAC missing or timeout | Inspect CronJob logs: `kubectl logs -n observability job/trivy-nightly-cluster-scan` |
+
+---
+
+## 6. Clean Reset
 
 ```bash
 # Nuclear (destroys DBs, carts):
@@ -190,7 +204,7 @@ docker compose logs -f --tail=50
 
 ---
 
-## 6. Getting Help
+## 7. Getting Help
 
 - File issue with `docker compose ps`, `curl http://localhost:8080/health | jq`, `docker compose logs <failing-svc> --tail=100`
 - Include manifest: `docker buildx imagetools inspect <image>`

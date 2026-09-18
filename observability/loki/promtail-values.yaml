@@ -1,0 +1,71 @@
+# Promtail Helm values — Log shipping daemonset for Ecom Microservices
+# Scrapes pod stdout/stderr, parses JSON / structured logs, extracts X-Request-ID
+
+daemonset:
+  enabled: true
+
+config:
+  logLevel: info
+  serverPort: 3101
+  clients:
+    - url: http://loki.observability.svc:3100/loki/api/v1/push
+
+  snippets:
+    pipelineStages:
+      # Stage 1: CRI / Container runtime format parsing
+      - cri: {}
+      # Stage 2: Extract standard microservice log pattern:
+      # "%(asctime)s %(levelname)s %(name)s %(message)s"
+      - regex:
+          expression: '^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\s+(?P<level>[A-Z]+)\s+(?P<service>[a-zA-Z0-9_\-]+)\s+(?P<message>.*)$'
+      # Stage 3: Label promotion for fast indexing
+      - labels:
+          level:
+          service:
+      # Stage 4: Extract X-Request-ID if present in message or JSON
+      - regex:
+          source: message
+          expression: 'X-Request-ID[:=]\s*(?P<request_id>[a-f0-9\-]+)'
+      - labels:
+          request_id:
+
+    extraScrapeConfigs: |
+      - job_name: ecom-microservices
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - ecom
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_eci_service]
+            target_label: service
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - replacement: /var/log/pods/*$1/*.log
+            separator: /
+            source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            target_label: __path__
+
+tolerations:
+  - key: "spot"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+  - operator: "Exists"
+    effect: "NoSchedule"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi

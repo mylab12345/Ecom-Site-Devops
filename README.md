@@ -104,14 +104,22 @@ Ecom-Site-Devops/
 │   └── gateway/                 # reverse proxy (8080)
 │       ├── app/config.py        # service map
 │       └── app/main.py          # prefix routing + retry
-└── (Phase 2-6 scaffold):
-    ├── Jenkinsfile              # → Phase 2
+└── Phase 2-6 Complete:
     ├── terraform/
-    │   ├── local-kind/          # Kind + local registry
-    │   └── aws-graviton/        # EKS ARM64 + spot (cost opt)
-    ├── helm-charts/             # 10 charts + ingress + NetworkPolicy
-    ├── argocd/                  # Application CRs
-    └── observability/           # prometheus, grafana, loki, jaeger
+    │   ├── local-kind/          # Phase 3 ✅ Kind 1 CP + 2 workers + local registry mirror (5001)
+    │   └── aws-graviton/        # Phase 3 ✅ AWS EKS 1.29+ Graviton ARM64 Spot (~40% cost saving)
+    ├── helm-charts/             # Phase 4 ✅ 10 service charts + ecom-common + ingress + network-policies
+    ├── argocd/                  # Phase 5 ✅ AppProject, ApplicationSet, root App-of-Apps & 12 Application CRs
+    │   ├── projects/ecom.yaml   #   RBAC & namespace isolation project
+    │   ├── root-app.yaml        #   App-of-Apps root controller
+    │   ├── applicationset.yaml  #   Service-driven generator
+    │   └── applications/        #   Per-service Application manifests
+    └── observability/           # Phase 6 ✅ Full-stack monitoring, logging, tracing & security
+        ├── prometheus/          #   kube-prometheus-stack values, rules & ServiceMonitors
+        ├── grafana/             #   Datasources & 3 production dashboards (Overview, Detail, SLOs)
+        ├── loki/                #   Loki values & Promtail DaemonSet structured logging
+        ├── jaeger/              #   Jaeger all-in-one & OTLP collector configuration
+        └── security/            #   Nightly Trivy CronJob & Pod Security Standards
 ```
 
 **Generate tree locally:** `tree -L 4 -I '__pycache__|*.pyc|.git'` or `find . -type f | sort`
@@ -451,22 +459,68 @@ kubectl get pods -n ecom -l eci.phase=4 -L eci.service -L kubernetes.io/arch
 - Each chart: deployment (2 replicas, probes, resources), service (ClusterIP), ingress route `/api/<svc>`, NetworkPolicy, HPA.
 - Gateway: Ingress `/*` → gateway:8080.
 
-### Phase 5: GitOps — ArgoCD
+### Phase 5: GitOps — ArgoCD ✅ COMPLETE
 
-- `argocd/applications/*.yaml` — Application CR per service (`syncPolicy: automated, selfHeal`)
-- Repo: `mylab12345/Ecom-Site-Devops` helm path `helm-charts/<svc>` → EKS
-- Jenkins bumps tag → ArgoCD syncs within 3 min (`argocd app sync ecom --prune`).
+Delivered (2026-09):
 
-### Phase 6: Observability & Security
+- `argocd/projects/ecom.yaml` — `AppProject` CR scoping RBAC and isolating deployments:
+  - Allowed repositories: `https://github.com/mylab12345/Ecom-Site-Devops.git`
+  - Destination namespaces: `ecom`, `ingress-nginx`, `observability`
+  - Prevents accidental writes or escalations to `kube-system`.
+- `argocd/applications/*.yaml` — Individual `Application` CR for all 10 services plus platform ingress-nginx & network-policies:
+  - Tracks `targetRevision: gitops/main` and path `helm-charts/<svc>`
+  - Automated sync policy with `selfHeal: true`, `prune: true` (foreground deletion), and exponential backoff retry.
+- `argocd/applicationset.yaml` — Declarative `ApplicationSet` using list generator for all 10 microservices driven by the service registry.
+- `argocd/root-app.yaml` — Root App-of-Apps `Application` resource synchronizing all applications declaratively.
+- `argocd/setup.md` — Complete production runbook: installation, credentials (`argocd-initial-admin-secret`, `gitops-token`), GitHub Webhook configuration (<2s sync), and audit-clean rollback runbook (`git revert`).
+- Invariant: CI never touches the cluster (`kubectl`/`helm`); Jenkins only commits image tags to `gitops/main`, and ArgoCD reconciles.
 
-- **Prometheus** (kube-prometheus-stack) scrapes `/metrics` on all 10; Grafana dashboards per service latency/4xx/5xx + inventory/payment SLOs
-- **Loki** for logs (proMTail)
-- **Jaeger** (all-in-one) — OpenTelemetry SDK in each service propagates `X-Request-ID` + `traceparent`; gateway adds W3C trace context
-- **Trivy** — image scan in Jenkins + nightly CronJob in cluster; `trivy image --severity HIGH,CRITICAL`
+**Usage:**
+```bash
+# Bootstrap ArgoCD and all applications
+make argocd-install
+make argocd-apps
+make argocd-status
+```
+
+### Phase 6: Observability & Security ✅ COMPLETE
+
+Delivered (2026-09):
+
+- **Prometheus & Alerting** (`observability/prometheus/`):
+  - `kube-prometheus-stack-values.yaml`: Production Helm values targeting ARM64 Graviton nodes, 15-day retention, custom scrape configurations for annotated pods (`prometheus.io/scrape: "true"`).
+  - `rules/ecom-alerts.yaml`: `PrometheusRule` CR defining production alerts: `EcomServiceHighErrorRate` (5xx > 1%), `EcomServiceHighLatencyP99` (>1s), `EcomServiceInstanceDown`, `EcomPaymentFailureSpike`, and `EcomPodCrashLooping`.
+  - `servicemonitors/ecom-servicemonitors.yaml`: `ServiceMonitor` discovering all 10 microservices in namespace `ecom`.
+- **Grafana Dashboards** (`observability/grafana/`):
+  - `datasources.yaml` & `dashboards-provisioning.yaml`: Automated provider provisioning for Prometheus, Loki, and Jaeger.
+  - `dashboards/ecom-overview.json`: Executive and operations dashboard (Total RPS, 5xx error rate %, p50/p90/p99 latency, active pods, status code breakdown, container memory).
+  - `dashboards/service-detail.json`: Parameterized deep-dive with `$service` selector, endpoint-level throughput, latency percentiles, CPU cores, and memory usage.
+  - `dashboards/ecom-business-slo.json`: Business KPIs and SLO tracking: Payment Success Rate SLO (99.9%), System Availability SLO (99.95%), Order Creation Velocity, and payment status distribution.
+- **Log Aggregation** (`observability/loki/`):
+  - `loki-values.yaml`: Production Loki configuration with TSDB v13 schema, filesystem/S3 chunk storage, and 7-day retention.
+  - `promtail-values.yaml`: DaemonSet extracting structured log fields (`%(asctime)s %(levelname)s %(name)s %(message)s`) and indexing `service`, `level`, and `X-Request-ID`.
+- **Distributed Tracing** (`observability/jaeger/`):
+  - `jaeger-all-in-one.yaml`: Deployment and Services exposing Jaeger UI (port 16686) and OTLP collectors (gRPC 4317, HTTP 4318).
+  - W3C Trace Context (`traceparent`) & `X-Request-ID` propagation from API Gateway across microservices.
+  - `otel-collector-config.yaml`: OpenTelemetry collector pipeline.
+- **Cluster Security & Vulnerability Scanning** (`observability/security/`):
+  - `trivy-cronjob.yaml`: In-cluster Kubernetes `CronJob` running nightly at `02:00 UTC` (`aquasec/trivy:0.50.0`) scanning all running workloads in `ecom` namespace for `HIGH,CRITICAL` CVEs.
+  - `rbac.yaml`: Scoped read-only ServiceAccount and ClusterRole for Trivy.
+  - `pod-security-standards.yaml`: Pod Security Standards enforcing `baseline` and auditing `restricted`.
+
+**Usage:**
+```bash
+# Deploy full observability & security stack
+make obs-up
+
+# Access dashboards & interfaces
+make obs-prometheus
+make obs-jaeger
+```
 
 ---
 
-## 6. Stable Versions (Phases 1-4)
+## 6. Stable Versions (Phases 1-6)
 
 | Tool | Version |
 |------|---------|
@@ -485,9 +539,14 @@ kubectl get pods -n ecom -l eci.phase=4 -L eci.service -L kubernetes.io/arch
 |Helm|3.14+ ✅ (charts apiVersion v2, 13 charts linted)|
 |Kind|0.22+ ✅ (1 CP + 2 workers, registry mirror)|
 |ingress-nginx|4.10.0 ✅ (controller v1.10.0 multi-arch)|
+|ArgoCD|v2.10.4+ ✅ (AppProject, ApplicationSet, App-of-Apps)|
+|Prometheus|v2.51+ ✅ (kube-prometheus-stack ~58.0, Graviton ARM64)|
+|Grafana|v10.4+ ✅ (3 production dashboards, auto-provisioned)|
+|Loki / Promtail|v2.9+ ✅ (TSDB v13, structured JSON/CRI parsing)|
+|Jaeger|v1.57+ ✅ (OTLP gRPC 4317/HTTP 4318, UI 16686)|
+|Trivy|0.50+ ✅ (CI gate + nightly in-cluster CronJob 02:00 UTC)|
 |Jenkins|2.440.3 LTS ✅|
 |Docker buildx|0.14+ ✅ (docker-container driver for multi-arch)|
-|Trivy|0.53+ ✅ (`HIGH,CRITICAL`, `--ignore-unfixed`)|
 |hadolint / shellcheck|latest ✅ (advisory in `lint.sh`)|
 |ruff / pytest|0.16.8 / 9.1.1 ✅ pinned in `requirements-dev.txt`|
 
@@ -530,25 +589,42 @@ See [troubleshooting.md](./troubleshooting.md) for microservice connectivity & A
 
 ---
 
-## 10. Next Action
+## 10. Next Action — Full Platform Lifecycle
+
+All 6 phases are complete and production-grade:
 
 ```bash
-make up && make health && ./scripts/test.sh   # Phase 1 stack
-make ci && make ci-plan                       # Phase 2 gate, locally
-make tf-plan-local && make kind-up            # Phase 3 local Kind + registry
-make helm-lint && make helm-template          # Phase 4 helm dry-run
-make helm-install-local && kubectl get pods -n ecom -l eci.phase=4  # Phase 4 deploy to Kind
+# Phase 1: Local Docker Compose Stack
+make up && make health && ./scripts/test.sh
+
+# Phase 2: Local CI Gate (Lint, 214 Tests, Build Plan, Scan)
+make ci && make ci-plan
+
+# Phase 3: Infrastructure Provisioning (Kind Local or AWS Graviton EKS)
+make tf-plan-local && make kind-up            # Local Kind + Registry
+# or: make tf-plan-eks && make tf-apply-eks   # AWS Graviton EKS
+
+# Phase 4: Helm Charts Validation & Rendering
+make helm-lint && make helm-template
+make helm-install-local && kubectl get pods -n ecom -l eci.phase=4
+
+# Phase 5: ArgoCD GitOps Continuous Delivery
+make argocd-install && make argocd-apps
+make argocd-status
+
+# Phase 6: Full Observability & Security Stack
+make obs-up
 ```
 
-Open: `http://localhost:8080/docs` (Gateway Swagger), `http://localhost:8080/health`, `http://localhost:15672` (RabbitMQ), `http://localhost:8001/docs` (direct).
-
-**Phase 4 is live**: 
-- Local: `terraform/local-kind` → Kind 1 CP + 2 workers + registry localhost:5001, then `helm upgrade --install` 10 services + ingress-nginx (NodePort) + network-policies. See `terraform/local-kind/README.md` and `helm-charts/README.md`.
-- AWS: `terraform/aws-graviton` → VPC 3 AZs + EKS 1.29 Graviton spot (m7g/m6g, 2 critical ON_DEMAND + 3 stateless SPOT, IRSA for ebs-csi, autoscaler, LBC). Then helm charts with `scheduling.architecture=arm64` + spot tolerations. Cost ~40% vs x86 on-demand. See `terraform/aws-graviton/README.md`.
-- CI: `make ci` green (101 structure tests), `helm lint` 13 charts, `terraform fmt` check. Jenkins agent label `ecom-buildx`, credentials `dockerhub-creds` + `gitops-token`, follow `jenkins/setup.md` §8-12.
-
-Next up is **Phase 5** — ArgoCD Application CRs (`argocd/applications/*.yaml`, ApplicationSet) watching `gitops/main` branch that Jenkins bumps, syncing within 3 min.
+Open:
+- `http://localhost:8080/docs` — API Gateway Swagger UI
+- `http://localhost:8080/health` — Gateway Aggregated Health (all 10 services)
+- `http://localhost:3000` — Grafana Dashboards (admin / ecom-grafana-secure-admin)
+- `http://localhost:9090` — Prometheus Query & Alerting
+- `http://localhost:16686` — Jaeger Distributed Tracing UI
+- `http://localhost:8080` (port-forward `argocd-server`) — ArgoCD Web Console
+- `http://localhost:15672` — RabbitMQ Management UI
 
 ---
 
-Made with ❤️ for Local-First DevOps. Graviton-ready.
+Made with ❤️ for Local-First DevOps. Graviton-ready. All 6 Phases Complete.

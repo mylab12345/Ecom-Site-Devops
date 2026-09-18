@@ -1,0 +1,40 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ecom-shipping
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: shipping
+    app.kubernetes.io/part-of: ecom
+    eci.service: shipping
+    eci.tier: critical
+    eci.phase: "5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: ecom
+  source:
+    repoURL: https://github.com/mylab12345/Ecom-Site-Devops.git
+    targetRevision: gitops/main
+    path: helm-charts/shipping
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ecom
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

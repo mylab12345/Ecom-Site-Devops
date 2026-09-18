@@ -1,46 +1,123 @@
-# argocd/ — Phase 5
+# argocd/ — Phase 5: GitOps Delivery ✅ COMPLETE
 
-Intentionally not a chart. This directory will hold one `Application` manifest per service,
-and the only thing Phase 2 does with ArgoCD is decide **what it watches**.
+Declarative GitOps engine managing continuous delivery for all 10 e-commerce microservices,
+platform networking, and ingress controllers across both local Kind and AWS EKS Graviton.
 
-## The hand-off
+---
 
-```
-Jenkins (Phase 2)                        ArgoCD (Phase 5)
-─────────────────                        ─────────────────
-build → scan → promote                   watch this repo at rev HEAD
-   │
-   └─ commit to origin/gitops/<branch> ─► Application.spec.source.targetRevision
-      (helm-charts/<svc>/values.yaml         └─ diff → sync → rollout
-       image.repository + image.tag)
-```
-
-`scripts/ci/gitops-bump.sh` writes `image.tag` on a **dedicated branch** (`GITOPS_BRANCH`,
-default `gitops/main`; pushing straight to the base branch is refused unless
-`GITOPS_ALLOW_DIRECT_MAIN=1`, so a bot can never land on protected `main` by accident — see
-`jenkins/setup.md` §6 for the credential that may write it). ArgoCD's `Application` points its
-`targetRevision` at that branch. CI never runs `argocd app sync`, `kubectl apply`, or
-`helm upgrade`. Not as a style rule: as the invariant that makes rollbacks a git operation and
-keeps ArgoCD's self-heal from racing a pipeline.
-
-## Consequences Phase 2 already accepts for Phase 5's sake
-
-| Decision here | Why ArgoCD needs it |
-|---|---|
-| `latest` is written only by the `Promote images` stage, after the Trivy gate | An Application pointing at a floating tag syncs whatever was pushed last, including unscanned builds. |
-| The bump commits **per green build**, and writes `image.digest` alongside the tag when the registry reports one | `argocd app diff` must be a readable audit trail, and a digest pins bytes that a mutable tag cannot. |
-| Bump stage is serialized: `disableConcurrentBuilds()` + a rebase-and-retry when the push is rejected | Two writers of the same `values.yaml` means one lost tag, silently. A conflict is *surfaced*, never auto-resolved. |
-| Bump runs only when `GITOPS_ENABLED` **and** images were pushed **and** the branch is trunk | A PR or tag build must not be able to move production's desired state. |
-| `GITOPS_ENABLED=false` turns the stage off entirely | Phase 3/4 bring-ups need the pipeline without the write, without editing the Jenkinsfile. |
-
-## What lands here in Phase 5
+## 1. Directory Structure
 
 ```
-argocd/applications/<service>.yaml     # one per service: repoURL, targetRevision, path helm-charts/<service>
-argocd/applicationset.yaml             # (preferred) the same ten objects generated from the service list
-argocd/projects/ecom.yaml              # source repos + destination namespaces, so a rogue Application cannot
-                                       # reach kube-system
+argocd/
+├── README.md                      # Architecture overview and usage (this file)
+├── setup.md                       # Complete production installation and runbook
+├── root-app.yaml                  # Root App-of-Apps application CR
+├── applicationset.yaml            # Generator for all 10 microservices from registry
+├── projects/
+│   └── ecom.yaml                  # AppProject CR (RBAC, destination and repo constraints)
+└── applications/
+    ├── identity.yaml              # Port 8001 (critical)
+    ├── product.yaml               # Port 8002 (stateless)
+    ├── inventory.yaml             # Port 8003 (stateless)
+    ├── cart.yaml                  # Port 8004 (stateless)
+    ├── order.yaml                 # Port 8005 (critical)
+    ├── payment.yaml               # Port 8006 (critical)
+    ├── shipping.yaml              # Port 8007 (critical)
+    ├── notification.yaml          # Port 8008 (stateless)
+    ├── review.yaml                # Port 8009 (stateless)
+    ├── gateway.yaml               # Port 8080 (edge)
+    ├── ingress-nginx.yaml         # Multi-arch ingress controller wrapper
+    └── network-policies.yaml      # Zero-trust network isolation policies
 ```
 
-The ApplicationSet generator should read the same list the pipeline does — `scripts/ci/lib/services.sh`
-is the only service registry in this repo (`make ci-plan` prints it as JSON if a generator needs it).
+---
+
+## 2. GitOps Workflow & Architecture
+
+```
+                                      Phase 2 Jenkins CI
+                                               │
+                                  Pushes multi-arch images &
+                                commits to gitops/main branch
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │ Git Repository (gitops/main)     │
+                              │ • helm-charts/<svc>/values.yaml  │
+                              └────────────────┬─────────────────┘
+                                               │
+                                      ArgoCD Reconciles
+                                               │
+                   ┌───────────────────────────┴───────────────────────────┐
+                   ▼                                                       ▼
+      ┌─────────────────────────┐                             ┌─────────────────────────┐
+      │   argocd/root-app.yaml   │                             │ argocd/applicationset   │
+      │   (App-of-Apps Pattern) │                             │   (List Generator)      │
+      └────────────┬────────────┘                             └────────────┬────────────┘
+                   │                                                       │
+                   └───────────────────────────┬───────────────────────────┘
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │      argocd/projects/ecom.yaml   │
+                              │ (Scoped to ecom & ingress-nginx) │
+                              └────────────────┬─────────────────┘
+                                               │
+        ┌──────────────┬──────────────┬────────┼──────────────┬──────────────┐
+        ▼              ▼              ▼        ▼              ▼              ▼
+     ecom-cart    ecom-order    ecom-gateway  ...      ingress-nginx  network-policies
+```
+
+### The Invariant Contract
+- **No cluster write permissions for CI**: Jenkins creates verified artifacts and records the state in Git (`gitops/main`).
+- **Automated Reconcile**: ArgoCD watches `gitops/main`. When values change, ArgoCD executes a rolling update.
+- **Drift Protection (Self-Healing)**: Manual changes inside the cluster are detected and immediately overwritten by ArgoCD.
+- **Pruning**: Removed resources from Helm charts are cleanly pruned in foreground mode.
+
+---
+
+## 3. Deployment Patterns
+
+### Pattern A: App-of-Apps (`root-app.yaml`) — Recommended
+Synchronizes all manifests in `argocd/applications/`:
+```bash
+kubectl apply -f argocd/projects/ecom.yaml
+kubectl apply -f argocd/root-app.yaml
+```
+
+### Pattern B: ApplicationSet (`applicationset.yaml`)
+Dynamically creates 10 Application CRs from the central service catalog:
+```bash
+kubectl apply -f argocd/projects/ecom.yaml
+kubectl apply -f argocd/applicationset.yaml
+```
+
+### Pattern C: Direct Service Applications
+Deploy individual services or platform charts:
+```bash
+kubectl apply -f argocd/projects/ecom.yaml
+kubectl apply -f argocd/applications/gateway.yaml
+kubectl apply -f argocd/applications/product.yaml
+```
+
+---
+
+## 4. Verification & Status Commands
+
+```bash
+# List all managed applications
+argocd app list
+
+# Inspect synchronization and health of a specific service
+argocd app get ecom-order
+
+# View diff between Git and cluster
+argocd app diff ecom-payment
+
+# Tail live rollout events
+argocd app logs ecom-gateway
+
+# Trigger manual synchronization
+argocd app sync ecom-product --prune
+```
+
+See `setup.md` for full installation, initial password extraction, and rollback procedures.
