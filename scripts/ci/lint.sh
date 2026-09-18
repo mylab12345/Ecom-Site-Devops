@@ -192,6 +192,77 @@ else
   fail "scripts/ci/unit-tests.sh missing or not executable"
 fi
 
+step "Helm charts: lint + template dry-run (advisory, needs helm)"
+if ecom_ci_optional helm "https://helm.sh/docs/intro/install/"; then
+  helm_bad=0
+  for chart in ecom-common identity product inventory cart order payment shipping notification review gateway ingress-nginx network-policies; do
+    if [[ -d "$ECOM_ROOT/helm-charts/$chart" ]]; then
+      if ! helm lint "$ECOM_ROOT/helm-charts/$chart" > "$(ecom_ci_out helm-lint-$chart.txt)" 2>&1; then
+        if [[ "${STRICT_TOOLS:-0}" == "1" ]]; then
+          fail "helm lint $chart"; cat "$(ecom_ci_out helm-lint-$chart.txt)" >&2
+        else
+          ecom_ci_warn "helm lint $chart findings (non-blocking): $(head -n 5 "$(ecom_ci_out helm-lint-$chart.txt)" | tr '\n' ' ')"
+        fi
+        helm_bad=1
+      fi
+      # Template + kubectl dry-run if kubectl available
+      if have kubectl; then
+        if ! helm template ecom "$ECOM_ROOT/helm-charts/$chart" -n ecom --set image.tag=ci-test > "$(ecom_ci_out helm-template-$chart.yaml)" 2>&1; then
+          ecom_ci_warn "helm template $chart failed (non-blocking)"
+          helm_bad=1
+        else
+          if ! kubectl apply --dry-run=client -f "$(ecom_ci_out helm-template-$chart.yaml)" > /dev/null 2>&1; then
+            if [[ "${STRICT_TOOLS:-0}" == "1" ]]; then
+              fail "helm template $chart kubectl dry-run failed"
+            else
+              ecom_ci_warn "helm template $chart kubectl dry-run failed (non-blocking)"
+            fi
+          fi
+        fi
+      else
+        # Just template without kubectl
+        helm template ecom "$ECOM_ROOT/helm-charts/$chart" -n ecom --set image.tag=ci-test > "$(ecom_ci_out helm-template-$chart.yaml)" 2>&1 || true
+      fi
+    fi
+  done
+  (( helm_bad == 0 )) && pass "helm lint + template — 13 charts (ecom-common + 10 services + ingress-nginx + network-policies)"
+else
+  note "helm not installed — skipping helm lint (runs on Jenkins agent with helm)"
+fi
+
+step "Terraform: fmt + validate (advisory, needs terraform)"
+if ecom_ci_optional terraform "https://developer.hashicorp.com/terraform/install"; then
+  tf_bad=0
+  if ! terraform fmt -check -recursive "$ECOM_ROOT/terraform" > "$(ecom_ci_out terraform-fmt.txt)" 2>&1; then
+    if [[ "${STRICT_TOOLS:-0}" == "1" ]]; then
+      fail "terraform fmt — run: terraform fmt -recursive terraform/"
+      cat "$(ecom_ci_out terraform-fmt.txt)" >&2
+    else
+      ecom_ci_warn "terraform fmt findings (non-blocking): run terraform fmt -recursive terraform/"
+    fi
+    tf_bad=1
+  fi
+  for mod in local-kind aws-graviton; do
+    if [[ -d "$ECOM_ROOT/terraform/$mod" ]]; then
+      if ! terraform -chdir="$ECOM_ROOT/terraform/$mod" init -backend=false -input=false > "$(ecom_ci_out terraform-init-$mod.txt)" 2>&1; then
+        ecom_ci_warn "terraform init $mod failed (non-blocking, needs network for modules)"
+      else
+        if ! terraform -chdir="$ECOM_ROOT/terraform/$mod" validate > "$(ecom_ci_out terraform-validate-$mod.txt)" 2>&1; then
+          if [[ "${STRICT_TOOLS:-0}" == "1" ]]; then
+            fail "terraform validate $mod"; cat "$(ecom_ci_out terraform-validate-$mod.txt)" >&2
+          else
+            ecom_ci_warn "terraform validate $mod findings (non-blocking)"
+          fi
+          tf_bad=1
+        fi
+      fi
+    fi
+  done
+  (( tf_bad == 0 )) && pass "terraform fmt + validate — local-kind + aws-graviton"
+else
+  note "terraform not installed — skipping fmt/validate (runs on Jenkins agent with terraform)"
+fi
+
 echo
 if (( FAIL )); then
   ecom_ci_err "lint: FAILED — see $ECI_OUT_DIR"

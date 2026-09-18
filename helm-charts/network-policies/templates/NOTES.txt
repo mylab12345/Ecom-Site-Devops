@@ -1,0 +1,19 @@
+NetworkPolicies installed in namespace {{ .Values.namespace }}:
+
+- default-deny: blocks all ingress unless explicitly allowed
+- allow-dns: allows kube-dns/coredns on 53/UDP+TCP
+- gateway-ingress: ingress-nginx -> gateway:8080
+- service edges: gateway -> identity, product, inventory, cart, order, payment, shipping, notification, review
+- infra edges: services -> postgres:5432, cart -> redis:6379, notification -> rabbitmq:5672
+
+Topology matches:
+  ingress → gateway:8080
+  gateway → identity:8001 product:8002 inventory:8003 cart:8004 order:8005 payment:8006 shipping:8007 notification:8008 review:8009
+  product → postgres:5432   identity → postgres   order → postgres + rabbitmq
+  cart    → redis:6379      notification → rabbitmq:5672
+
+Verify:
+  kubectl get networkpolicies -n {{ .Values.namespace }}
+  kubectl describe networkpolicy -n {{ .Values.namespace }}
+
+Ports from scripts/ci/lib/services.sh — gateway ROUTES table drives allowed hops.

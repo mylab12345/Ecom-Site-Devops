@@ -1,0 +1,40 @@
+{{- if .Values.enabled }}
+{{- $root := . }}
+{{- range $infra, $cfg := .Values.infra }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "network-policies.fullname" $root }}-{{ $infra }}-allow
+  namespace: {{ $root.Values.namespace }}
+  labels:
+    {{- include "network-policies.labels" $root | nindent 4 }}
+    ecom.infra: {{ $infra }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: {{ $infra }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- range $client := $cfg.clients }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: {{ $client }}
+      ports:
+        - protocol: TCP
+          port: {{ $cfg.port }}
+    {{- end }}
+    {{- if $cfg.managementPort }}
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: prometheus
+      ports:
+        - protocol: TCP
+          port: {{ $cfg.managementPort }}
+    {{- end }}
+{{- end }}
+{{- end }}

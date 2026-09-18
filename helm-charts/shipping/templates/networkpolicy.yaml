@@ -1,0 +1,208 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "shipping.fullname" . }}
+  labels:
+    {{- include "shipping.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "shipping.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gateway
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+    {{- with .Values.networkPolicy.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if eq "shipping" "cart" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: product
+      ports:
+        - port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: redis
+      ports:
+        - port: 6379
+    {{- else if eq "shipping" "inventory" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: product
+      ports:
+        - port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - port: 5432
+    {{- else if eq "shipping" "order" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: product
+      ports:
+        - port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: inventory
+      ports:
+        - port: 8003
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: payment
+      ports:
+        - port: 8006
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: cart
+      ports:
+        - port: 8004
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: shipping
+      ports:
+        - port: 8007
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: notification
+      ports:
+        - port: 8008
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - port: 5432
+    {{- else if eq "shipping" "payment" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: order
+      ports:
+        - port: 8005
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: notification
+      ports:
+        - port: 8008
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - port: 5432
+    {{- else if eq "shipping" "shipping" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: order
+      ports:
+        - port: 8005
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: notification
+      ports:
+        - port: 8008
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - port: 5432
+    {{- else if eq "shipping" "notification" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: rabbitmq
+      ports:
+        - port: 5672
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - port: 5432
+    {{- else if eq "shipping" "review" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: product
+      ports:
+        - port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: order
+      ports:
+        - port: 8005
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - port: 5432
+    {{- else if eq "shipping" "gateway" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: ecom-platform
+      ports:
+        - port: 8001
+        - port: 8002
+        - port: 8003
+        - port: 8004
+        - port: 8005
+        - port: 8006
+        - port: 8007
+        - port: 8008
+        - port: 8009
+    {{- else }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - port: 5432
+    {{- end }}
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -1,6 +1,8 @@
 .PHONY: help up down logs build ps clean restart test seed health fmt \
         ci ci-deps ci-lint ci-test ci-test-docker ci-build ci-push ci-scan ci-smoke ci-all ci-clean \
-        gitops-bump gitops-dry ci-plan doctor
+        gitops-bump gitops-dry ci-plan doctor \
+        tf-fmt tf-validate tf-plan-local tf-apply-local tf-destroy-local tf-plan-eks tf-apply-eks \
+        helm-lint helm-template helm-deps kind-up kind-down eks-kubeconfig
 
 # ── Phase 1: local stack ─────────────────────────────────────────────────────
 help: ## Show help
@@ -103,3 +105,71 @@ gitops-bump: ## Commit (and optionally push) helm values image tags from .ci-out
 
 ci-clean: ## Remove CI artifacts (never touches the buildx layer cache)
 	@rm -rf .ci-output && echo "removed .ci-output/"
+
+# ── Phase 3: Terraform — local Kind + AWS Graviton EKS ─────────────────────
+tf-fmt: ## Terraform fmt check (all modules)
+	@terraform fmt -check -recursive terraform/ && echo "terraform fmt OK" || (terraform fmt -diff -recursive terraform/; exit 1)
+
+tf-validate: ## Validate terraform modules (no backend)
+	@for d in terraform/local-kind terraform/aws-graviton; do echo "=== $$d ==="; terraform -chdir=$$d init -backend=false -input=false && terraform -chdir=$$d validate; done
+
+tf-plan-local: ## Plan Kind cluster (local)
+	@terraform -chdir=terraform/local-kind init && terraform -chdir=terraform/local-kind plan
+
+tf-apply-local: ## Apply Kind cluster (creates registry + kind cluster)
+	@terraform -chdir=terraform/local-kind apply -auto-approve
+
+tf-destroy-local: ## Destroy Kind cluster
+	@terraform -chdir=terraform/local-kind destroy -auto-approve
+
+tf-plan-eks: ## Plan EKS Graviton (needs AWS creds)
+	@terraform -chdir=terraform/aws-graviton init && terraform -chdir=terraform/aws-graviton plan
+
+tf-apply-eks: ## Apply EKS Graviton (needs AWS creds)
+	@terraform -chdir=terraform/aws-graviton apply -auto-approve
+
+kind-up: tf-apply-local ## Alias for local Kind up
+kind-down: tf-destroy-local ## Alias for Kind down
+
+eks-kubeconfig: ## Configure kubectl for EKS (needs AWS creds + cluster exists)
+	@aws eks update-kubeconfig --region $${AWS_REGION:-us-east-1} --name $${CLUSTER_NAME:-ecom-eks-graviton}
+
+# ── Phase 4: Helm Charts — K8s Orchestration ───────────────────────────────
+helm-deps: ## Update helm dependencies for all charts (ecom-common library)
+	@for d in helm-charts/*/; do echo "=== $$d ==="; helm dependency update $$d 2>&1 | tail -n 5 || true; done
+
+helm-lint: ## Lint all helm charts (needs helm)
+	@which helm >/dev/null 2>&1 || { echo "helm not installed — skipping"; exit 0; }
+	@for chart in ecom-common identity product inventory cart order payment shipping notification review gateway ingress-nginx network-policies; do \
+	  echo "=== helm-charts/$$chart ==="; helm lint helm-charts/$$chart || exit 1; \
+	done
+	@echo "helm lint OK — 13 charts"
+
+helm-template: ## Render all charts (dry-run, no cluster needed)
+	@which helm >/dev/null 2>&1 || { echo "helm not installed — skipping"; exit 0; }
+	@mkdir -p .ci-output/helm
+	@for svc in identity product inventory cart order payment shipping notification review gateway; do \
+	  echo "=== $$svc ==="; helm template ecom helm-charts/$$svc -n ecom --set image.tag=ci-test > .ci-output/helm/$$svc.yaml; \
+	  echo "  -> .ci-output/helm/$$svc.yaml ($$(wc -l < .ci-output/helm/$$svc.yaml) lines)"; \
+	done
+	@helm template ingress-nginx helm-charts/ingress-nginx -n ingress-nginx > .ci-output/helm/ingress-nginx.yaml || true
+	@helm template network-policies helm-charts/network-policies -n ecom > .ci-output/helm/network-policies.yaml || true
+	@echo "helm template OK — rendered to .ci-output/helm/"
+
+helm-install-local: ## Install all charts to Kind (needs KUBECONFIG from tf-apply-local)
+	@for svc in identity product inventory cart order payment shipping notification review gateway; do \
+	  helm upgrade --install $$svc ./helm-charts/$$svc -n ecom --create-namespace --set image.repository=localhost:5001/ecom-$$svc --set image.tag=local; \
+	done
+	@helm upgrade --install ingress-nginx ./helm-charts/ingress-nginx -n ingress-nginx --create-namespace \
+	  --set ingress-nginx-upstream.controller.service.type=NodePort \
+	  --set ingress-nginx-upstream.controller.hostPort.enabled=true || true
+	@helm upgrade --install network-policies ./helm-charts/network-policies -n ecom || true
+	@kubectl get pods -n ecom -l eci.phase=4
+
+helm-uninstall-local: ## Uninstall all charts from Kind
+	@for svc in gateway review notification shipping payment order cart inventory product identity; do \
+	  helm uninstall $$svc -n ecom || true; \
+	done
+	@helm uninstall ingress-nginx -n ingress-nginx || true
+	@helm uninstall network-policies -n ecom || true
+

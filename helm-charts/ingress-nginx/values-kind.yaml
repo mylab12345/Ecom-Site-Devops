@@ -1,0 +1,21 @@
+# Kind override for ingress-nginx — NodePort + hostPort 80/443
+ingress-nginx-upstream:
+  controller:
+    service:
+      type: NodePort
+    hostPort:
+      enabled: true
+      ports:
+        http: 80
+        https: 443
+    nodeSelector:
+      kubernetes.io/os: linux
+      # Allow amd64 for local Kind (laptop may be amd64)
+    tolerations: []
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi

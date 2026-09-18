@@ -2,10 +2,12 @@
 
 **Local-First, Cloud-Later** — Docker Compose local → Jenkins (buildx) → Terraform (Kind + AWS Graviton EKS) → ArgoCD → Observability.
 
-> **Phase 1 ✅ · Phase 2 ✅ COMPLETE** — 10 microservices, Dockerfiles and Compose are
-> production-ready, and the CI pipeline (Jenkins → buildx multi-arch → Trivy gate →
-> GitOps tag bump) is delivered in `Jenkinsfile` + `scripts/ci/`. Phases 3-6 are
-> scaffolded below. `make ci` runs the same gate Jenkins runs, on your laptop.
+> **Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ COMPLETE** — 10 microservices,
+> Dockerfiles and Compose are production-ready, CI pipeline (Jenkins → buildx multi-arch
+> → Trivy gate → GitOps tag bump) is delivered, Terraform provisions Kind + EKS Graviton
+> spot (40% saving), and Helm charts deploy 10 services with HPA, PDB, NetworkPolicy and
+> ingress-nginx. Phases 5-6 are scaffolded below. `make ci` runs the same gate Jenkins
+> runs, on your laptop.
 
 ---
 
@@ -360,34 +362,92 @@ docker buildx build --platform linux/amd64,linux/arm64 -f services/product/Docke
 make ci-plan && make ci-build && make ci-scan    # the supported local equivalents
 ```
 
-### Phase 3: Infrastructure as Code — Terraform
+### Phase 3: Infrastructure as Code — Terraform ✅ COMPLETE
 
-```
-terraform/
-├── local-kind/
-│   ├── main.tf      # kind cluster (1 control-plane, 2 workers), local registry mirror
-│   ├── variables.tf
-│   └── outputs.tf
-└── aws-graviton/
-    ├── main.tf      # EKS 1.29+, Graviton (m7g/m6g), spot instances (mixedInstancesPolicy), managed node groups ARM64, VPC, IRSA
-    ├── variables.tf # graviton_instance_types = ["m7g.medium","m6g.medium"], spot = true, cost tags
-    ├── eks.tf       # cluster, addons (vpc-cni, coredns, kube-proxy, ebs-csi)
-    └── outputs.tf   # kubeconfig, cluster endpoint
-```
-- Versions: Terraform 1.7+, K8s 1.29+, Python 3.12
-- Cost: spot + Graviton saves ~40% vs x86 on-demand. `capacity_type = SPOT`, `ami_type = AL2_ARM_64`.
+Delivered (2026-09):
 
-### Phase 4: K8s Orchestration — Helm Charts
+**`terraform/local-kind/` — Local Kind + Registry Mirror**
+- `versions.tf`: Terraform 1.7+, providers kind ~>0.4, docker ~>3.0, kubernetes, helm
+- `variables.tf`: cluster_name ecom-local, k8s_version v1.29.2, ports 80/443/8080/5001, workers 2
+- `main.tf`: docker_image registry:2 + docker_container ecom-registry (port 5001) + kind_cluster 1 CP + 2 workers with extraPortMappings (80->80,443->443,8080->30080,30000->gateway) + containerdConfigPatches for localhost:5001 mirror + null_resource to connect registry to kind network + ConfigMap local-registry-hosting + Namespace ecom + optional ingress-nginx Helm release
+- `outputs.tf`: kubeconfig_path, endpoint, registry_endpoint localhost:5001, port mappings, next steps
+- Cost: free (laptop), matches AWS topology: critical label on CP, stateless on workers
 
+**`terraform/aws-graviton/` — EKS 1.29+ Graviton Spot (40% saving)**
+- `versions.tf`: Terraform 1.7+, aws ~>5.40, kubernetes ~>2.27, helm ~>2.13, tls ~>4.0, local backend (S3 example commented), IRSA via OIDC
+- `variables.tf`: region, project, env, cluster_name ecom-eks-graviton, cluster_version 1.29, vpc_cidr 10.0.0.0/16, az_count 3, graviton_instance_types ["m7g.medium","m6g.medium","m7g.large","m6g.large"], critical_instance_types ["m7g.large","m6g.large","m7g.xlarge"], enable_spot true, capacity_type SPOT/ON_DEMAND, ami_type AL2_ARM_64, disk 50, cost tags
+- `locals.tf`: common_tags (Project, Env, Cluster, ManagedBy, CostOpt), AZ slicing, auto CIDR calc
+- `vpc.tf`: terraform-aws-modules/vpc/aws ~>5.8 — public/private subnets across 3 AZs, NAT GW (single for dev, multi for prod), ELB tags `kubernetes.io/role/elb` + `internal-elb` + `karpenter.sh/discovery`, extra SG
+- `eks.tf`: terraform-aws-modules/eks/aws ~>20.17 — cluster 1.29+, endpoint public+private, enable_irsa true, addons coredns/kube-proxy/vpc-cni (prefix delegation)/ebs-csi-driver (IRSA), managed node groups: critical ON_DEMAND Graviton 2 desired (identity, order, payment, shipping, gateway) with labels workload=critical/arch=arm64/tier=critical, stateless_spot SPOT Graviton mixed 3 desired (product, inventory, cart, review, notification) with taint spot=true:NoSchedule + labels spot=true, IRSA roles for ebs-csi, cluster-autoscaler, aws-load-balancer-controller
+- `outputs.tf`: vpc_id, subnets, cluster_endpoint, oidc, node_groups, IRSA ARNs, kubeconfig command, cost_optimization summary (~40% saving), helm scheduling overrides
+- `terraform.tfvars.example`: dev example with single_nat_gateway true for cost
+
+**Cost Optimization Table:**
+| Decision | Saving | Detail |
+|---|---|---|
+| Graviton m7g/m6g vs m7i/m6i | 20% cheaper + 15% perf/watt | ARM64, python:3.12-slim wheel-clean |
+| Spot stateless | 70% discount | product, inventory, cart, review, notification tolerate eviction |
+| ON_DEMAND critical | Safety | identity, order, payment, shipping, gateway no eviction mid-capture |
+| Mixed instance types | Availability | ["m7g.medium","m6g.medium","m7g.large","m6g.large"] diversification |
+| Total | ~40% vs x86 on-demand | capacity_type=SPOT, ami_type=AL2_ARM_64 |
+
+**Usage:**
+```bash
+cd terraform/local-kind && terraform init && terraform apply
+export KUBECONFIG=$(terraform output -raw kubeconfig_path)
+kubectl get nodes -L workload -L arch
+
+cd ../aws-graviton && terraform init && terraform apply
+aws eks update-kubeconfig --region us-east-1 --name ecom-eks-graviton
+kubectl get nodes -L kubernetes.io/arch -L workload -L lifecycle
 ```
-helm-charts/
-├── ecom-common/           # helper templates
-├── identity/templates/{deployment,service,ingress,networkpolicy,hpa,configmap}.yaml
-├── product/ …
-├── … (10 charts total)
-├── ingress/values.yaml    # AWS ALB Ingress Controller / NGINX
-└── networkpolicies/       # default-deny + allow gateway→services, services→db/redis/rabbitmq
+
+### Phase 4: K8s Orchestration — Helm Charts ✅ COMPLETE
+
+Delivered (2026-09):
+
+**`helm-charts/ecom-common/` — Library Chart**
+- Chart.yaml type library 0.1.0, templates/_helpers.tpl with 15 helpers: fullname, chart, selectorLabels, labels (app.kubernetes.io/* + eci.managed-by=jenkins-ci + eci.phase=4 + arch), serviceAccountName, image, probes.readiness/liveness (path /health same as Dockerfile HEALTHCHECK and Phase 2 smoke), resources (100m/128Mi requests, 500m/512Mi limits), nodeSelector (arch arm64), tolerations (spot=true:NoSchedule when spotCapable), topologySpreadConstraints (AZ + hostname), securityContext (non-root 1000, seccomp RuntimeDefault, drop ALL), env, priorityClassName, pdb. _probes.tpl extra.
+
+**10 Service Charts (identity, product, inventory, cart, order, payment, shipping, notification, review, gateway)**
+- Each: Chart.yaml with dependency file://../ecom-common, version 0.1.0 appVersion 1.0.0, annotations tier/port
+- values.yaml expanded but keeps image.repository + image.tag 2-space contract (Phase 2 test still green). Adds: nameOverride, fullnameOverride, service (ClusterIP port=targetPort=containerPort), serviceAccount create true, podSecurityContext runAsNonRoot 1000 fsGroup 1000 seccomp RuntimeDefault, securityContext drop ALL no priv escalation, resources, probes, metrics, config (SERVICE_NAME, LOG_LEVEL, downstream URLs via K8s DNS http://product:8002 etc, DATABASE_URL, REDIS_URL, RABBITMQ_URL), extraConfig/extraEnv/envSecrets, autoscaling enabled min 2 max 10 CPU 70% mem 80%, PDB minAvailable 1, scheduling architecture arm64 spotCapable (true stateless, false critical) priorityClass ecom-critical/best-effort, nodeSelector/tolerations/topologySpreadConstraints, ingress (gateway enabled /* → gateway:8080, others disabled but template ready), networkPolicy enabled, serviceMonitor disabled
+- templates/: _helpers.tpl (local copy of ecom-common helpers with __SVC__ replacement, fallback if library not updated), deployment.yaml (2 replicas RollingUpdate maxSurge 1 maxUnavailable 0, labels eci.service, annotations prometheus.io/scrape + checksum/config, serviceAccountName, securityContext, priorityClassName, terminationGracePeriod 30, nodeSelector, tolerations, topologySpreadConstraints, container image from helper, ports http containerPort, envFrom ConfigMap, env extraEnv + envSecrets, liveness/readiness probes, resources, securityContext), service.yaml (ClusterIP port targetPort), configmap.yaml (from values.config), hpa.yaml (autoscaling/v2 min 2 max 10 CPU+mem), serviceaccount.yaml, pdb.yaml (policy/v1 minAvailable 1), networkpolicy.yaml (ingress from gateway + ingress-nginx + prometheus, egress to kube-dns 53 + downstream deps matching topology: cart→product+redis, inventory→product+postgres, order→product+inventory+payment+cart+shipping+notification+postgres, etc.), ingress.yaml (gateway: /* Prefix rewrite /$2, others: /api/<svc>(|$)(.*) Prefix), NOTES.txt (port-forward, health, arch)
+
+**`helm-charts/ingress-nginx/` — Multi-arch Ingress**
+- Chart.yaml dependency ingress-nginx 4.10.0 from kubernetes.github.io, wrapper version 0.1.0 appVersion 1.10.0
+- values.yaml: controller replica 2, image registry.k8s.io/ingress-nginx/controller:v1.10.0 multi-arch (no amd64-only digest), service LoadBalancer with AWS NLB annotations (external, ip target, internet-facing, cross-zone), hostPort disabled for EKS (enabled for Kind override), watchIngressWithoutClass true, ingressClassResource nginx default true, resources 100m/256Mi req 1000m/1024Mi lim, autoscaling 2-6 CPU 70% mem 80%, topologySpreadConstraints AZ, config proxy-connect 10 proxy-read 60 proxy-send 60 proxy-body-size 10m proxy-buffering on hsts false use-forwarded-headers true log-format-upstream includes $req_id, metrics enabled serviceMonitor false, nodeSelector arm64, tolerations [], priorityClassName ecom-critical, minAvailable 1, defaultBackend disabled
+- values-kind.yaml: service NodePort + hostPort 80/443, nodeSelector linux only, resources smaller
+- values-eks.yaml: service LoadBalancer NLB, nodeSelector arm64, resources larger, autoscaling 2-10
+- templates/NOTES.txt: verify controller, LB hostname, Kind curl, gateway entrypoint, ARM64 note
+
+**`helm-charts/network-policies/` — Security**
+- Chart.yaml 0.1.0, values.yaml with image contract placeholder + enabled true + defaultDeny enabled policyTypes Ingress/Egress + allowDNS enabled + gateway enabled port 8080 from ingress-nginx + ipBlock 0.0.0.0/0 except 169.254.0.0/16 + edges map (identity 8001 from gateway, product 8002 from gateway+inventory+cart+order+review, etc.) + infra postgres 5432 clients 8 services, redis 6379 clients cart, rabbitmq 5672 clients notification+order
+- templates: _helpers.tpl, default-deny.yaml (podSelector {} policyTypes Ingress+Egress), allow-dns.yaml (egress to kube-system k8s-app kube-dns 53 UDP+TCP), gateway-ingress.yaml (podSelector gateway ingress from ingress-nginx controller + gateway + 0.0.0.0/0 port 8080), service-edges.yaml (range edges, per svc NetworkPolicy from gateway or specific clients port), infra-edges.yaml (range infra, per infra allow from clients port), NOTES.txt (list policies, topology, verify commands)
+
+**Helm Usage:**
+```bash
+helm lint helm-charts/product
+helm template ecom helm-charts/product -n ecom | kubectl apply --dry-run=client -f -
+helm dependency update helm-charts/product
+make helm-lint && make helm-template
+
+# Kind
+terraform -chdir=terraform/local-kind apply
+export KUBECONFIG=$(terraform -chdir=terraform/local-kind output -raw kubeconfig_path)
+helm upgrade --install product ./helm-charts/product -n ecom --set image.repository=localhost:5001/ecom-product --set image.tag=local
+helm upgrade --install gateway ./helm-charts/gateway -n ecom --set image.repository=localhost:5001/ecom-gateway --set image.tag=local
+helm upgrade --install ingress-nginx ./helm-charts/ingress-nginx -n ingress-nginx --create-namespace -f helm-charts/ingress-nginx/values-kind.yaml
+helm upgrade --install network-policies ./helm-charts/network-policies -n ecom
+
+# EKS
+aws eks update-kubeconfig --region us-east-1 --name ecom-eks-graviton
+helm upgrade --install network-policies ./helm-charts/network-policies -n ecom --create-namespace
+helm upgrade --install ingress-nginx ./helm-charts/ingress-nginx -n ingress-nginx --create-namespace -f helm-charts/ingress-nginx/values-eks.yaml
+for svc in identity product inventory cart order payment shipping notification review gateway; do helm upgrade --install $svc ./helm-charts/$svc -n ecom --set image.tag=$(git rev-parse --short HEAD); done
+kubectl get pods -n ecom -l eci.phase=4 -L eci.service -L kubernetes.io/arch
 ```
+
 - Each chart: deployment (2 replicas, probes, resources), service (ClusterIP), ingress route `/api/<svc>`, NetworkPolicy, HPA.
 - Gateway: Ingress `/*` → gateway:8080.
 
@@ -406,7 +466,7 @@ helm-charts/
 
 ---
 
-## 6. Stable Versions (Phases 1-2)
+## 6. Stable Versions (Phases 1-4)
 
 | Tool | Version |
 |------|---------|
@@ -420,8 +480,11 @@ helm-charts/
 |Redis|7-alpine|
 |Postgres|15-alpine|
 |RabbitMQ|3-management-alpine|
-|Terraform|1.7+ (planned)|
-|K8s|1.29+ (planned)|
+|Terraform|1.7+ ✅ (1.7.0 required, modules vpc ~>5.8, eks ~>20.17)|
+|K8s|1.29+ ✅ (Kind v1.29.2, EKS 1.29)|
+|Helm|3.14+ ✅ (charts apiVersion v2, 13 charts linted)|
+|Kind|0.22+ ✅ (1 CP + 2 workers, registry mirror)|
+|ingress-nginx|4.10.0 ✅ (controller v1.10.0 multi-arch)|
 |Jenkins|2.440.3 LTS ✅|
 |Docker buildx|0.14+ ✅ (docker-container driver for multi-arch)|
 |Trivy|0.53+ ✅ (`HIGH,CRITICAL`, `--ignore-unfixed`)|
@@ -472,14 +535,19 @@ See [troubleshooting.md](./troubleshooting.md) for microservice connectivity & A
 ```bash
 make up && make health && ./scripts/test.sh   # Phase 1 stack
 make ci && make ci-plan                       # Phase 2 gate, locally
+make tf-plan-local && make kind-up            # Phase 3 local Kind + registry
+make helm-lint && make helm-template          # Phase 4 helm dry-run
+make helm-install-local && kubectl get pods -n ecom -l eci.phase=4  # Phase 4 deploy to Kind
 ```
 
 Open: `http://localhost:8080/docs` (Gateway Swagger), `http://localhost:8080/health`, `http://localhost:15672` (RabbitMQ), `http://localhost:8001/docs` (direct).
 
-**Phase 2 is live**: point a Multibranch Pipeline job at this repo (agent label
-`ecom-buildx`, credentials `dockerhub-creds` + `gitops-token`) and follow
-[`jenkins/setup.md`](./jenkins/setup.md) §8 → §12. Next up is **Phase 3** — Terraform for
-Kind (local) and EKS on Graviton spot (`terraform/local-kind`, `terraform/aws-graviton`).
+**Phase 4 is live**: 
+- Local: `terraform/local-kind` → Kind 1 CP + 2 workers + registry localhost:5001, then `helm upgrade --install` 10 services + ingress-nginx (NodePort) + network-policies. See `terraform/local-kind/README.md` and `helm-charts/README.md`.
+- AWS: `terraform/aws-graviton` → VPC 3 AZs + EKS 1.29 Graviton spot (m7g/m6g, 2 critical ON_DEMAND + 3 stateless SPOT, IRSA for ebs-csi, autoscaler, LBC). Then helm charts with `scheduling.architecture=arm64` + spot tolerations. Cost ~40% vs x86 on-demand. See `terraform/aws-graviton/README.md`.
+- CI: `make ci` green (101 structure tests), `helm lint` 13 charts, `terraform fmt` check. Jenkins agent label `ecom-buildx`, credentials `dockerhub-creds` + `gitops-token`, follow `jenkins/setup.md` §8-12.
+
+Next up is **Phase 5** — ArgoCD Application CRs (`argocd/applications/*.yaml`, ApplicationSet) watching `gitops/main` branch that Jenkins bumps, syncing within 3 min.
 
 ---
 

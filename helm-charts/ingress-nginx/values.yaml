@@ -1,0 +1,129 @@
+# ingress-nginx values — Phase 4 wrapper
+# Pinned by terraform/aws-graviton at version 4.10.0, multi-arch image.
+# Gateway is the only HTTP entrypoint (8080), other services ClusterIP.
+# Gateway strips /api prefix, so ingress must NOT rewrite paths except gateway's /* -> /$2.
+
+# Upstream chart values via alias ingress-nginx-upstream
+ingress-nginx-upstream:
+  controller:
+    replicaCount: 2
+
+    # Multi-arch image — do NOT pin amd64-only digest
+    image:
+      registry: registry.k8s.io
+      image: ingress-nginx/controller
+      tag: "v1.10.0"
+      digest: "" # multi-arch digest resolved by registry
+      # digestChroot: ""
+
+    admissionWebhooks:
+      enabled: true
+      failurePolicy: Fail
+      patch:
+        enabled: true
+        image:
+          registry: registry.k8s.io
+          image: ingress-nginx/kube-webhook-certgen
+          tag: v1.4.1
+
+    # Service: LoadBalancer on AWS, NodePort on Kind
+    service:
+      type: LoadBalancer
+      annotations:
+        # AWS Load Balancer Controller annotations (when using ALB)
+        # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+        # service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+        # service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "tcp"
+        service.beta.kubernetes.io/aws-load-balancer-type: "external"
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+        service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+      # For Kind local, override to NodePort via --set
+
+    # HostPort for Kind (when service.type=NodePort, hostPort enables 80/443 on host)
+    hostPort:
+      enabled: false
+      ports:
+        http: 80
+        https: 443
+
+    # Watch without class for backward compat, but we set className nginx in gateway chart
+    watchIngressWithoutClass: true
+    ingressClassResource:
+      name: nginx
+      enabled: true
+      default: true
+      controllerValue: "k8s.io/ingress-nginx"
+
+    # Resources for Graviton
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1024Mi
+
+    # Autoscaling
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+      targetMemoryUtilizationPercentage: 80
+
+    # Topology spread across AZs
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: ingress-nginx
+            app.kubernetes.io/component: controller
+
+    # Config: important for gateway 502 prevention
+    config:
+      # Gateway does its own retry (3x), ingress should not retry and hide 502
+      proxy-connect-timeout: "10"
+      proxy-read-timeout: "60"
+      proxy-send-timeout: "60"
+      proxy-body-size: "10m"
+      proxy-buffering: "on"
+      # HSTS off for local dev, on for prod via override
+      hsts: "false"
+      # Use forwarded headers
+      use-forwarded-headers: "true"
+      # Allow X-Request-ID propagation
+      enable-underscores-in-headers: "true"
+      # Don't rewrite — gateway strips /api itself, two layers fighting causes 404
+      # Individual ingresses set rewrite-target /$2 for /* -> /
+      # Global no rewrite
+      # Custom headers for tracing
+      log-format-upstream: '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_length $request_time [$proxy_upstream_name] [$proxy_alternative_upstream_name] $upstream_addr $upstream_response_length $upstream_response_time $upstream_status $req_id'
+
+    # Metrics for Prometheus (Phase 6)
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: false # enable in observability phase
+
+    # Node selector for Graviton
+    nodeSelector:
+      kubernetes.io/arch: arm64
+      kubernetes.io/os: linux
+
+    # Tolerate spot? No — ingress is critical, on-demand only
+    tolerations: []
+
+    # Priority
+    priorityClassName: ecom-critical
+
+    # PodDisruptionBudget
+    minAvailable: 1
+
+  # Default backend (optional)
+  defaultBackend:
+    enabled: false
+
+# For local Kind, use this override file: values-kind.yaml
+# controller.service.type=NodePort, controller.hostPort.enabled=true
