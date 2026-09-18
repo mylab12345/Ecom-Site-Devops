@@ -289,6 +289,20 @@ Agent setup, credentials, plugins, JCasC, webhooks, timings, and the failure tab
 
 ## 5. Roadmap — Phases 2-6 (Local → AWS)
 
+**How a phase lands** (same every phase, so "done" means one thing):
+
+1. Work happens on the phase branch; nothing is committed straight to `main`.
+2. `make ci` green — the gate you can reproduce locally, not a badge on a page.
+3. `git push` the branch → open a PR against `main` with the stage/test/decision tables
+   and an honest "verified here / not verified here" section.
+4. Merge the PR (`gh pr merge --merge`, GitHub-side, matching how Phase 1 landed), then
+   fast-forward the phase branch onto `main` so the next phase starts from the merge commit.
+
+A phase is not complete while its PR is open, and no phase is started on top of an
+unmerged previous one — Phase 4's charts must be able to assume Phase 2's bump contract
+exists in `main`, not just in a branch.
+
+
 ### Phase 2: Jenkins CI — Pipeline-as-Code + Multi-arch ✅ COMPLETE
 
 Delivered (2026-09):
