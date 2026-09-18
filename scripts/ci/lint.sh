@@ -157,17 +157,22 @@ else
 fi
 
 step "Jenkinsfile structure: delimiters, stages, interpolation traps (blocking)"
-jf="$ECOM_ROOT/Jenkinsfile"
-if [[ -f "$jf" ]]; then
-  if "$PY" "$ECI_LIB_DIR/check_jenkinsfile.py" "$jf" > "$(ecom_ci_out jenkinsfile.txt)" 2>&1; then
-    pass "Jenkinsfile sanity — $(head -n 1 "$(ecom_ci_out jenkinsfile.txt)" | sed 's/^OK [^:]*: //')"
-  else
-    fail "Jenkinsfile findings (Jenkins would reject it, or run something other than what you wrote):"
-    cat "$(ecom_ci_out jenkinsfile.txt)" >&2
+jf_all="$(ecom_ci_out jenkinsfile.txt)"
+: > "$jf_all"
+for jf in "$ECOM_ROOT/Jenkinsfile.local" "$ECOM_ROOT/Jenkinsfile.aws"; do
+  if [[ ! -f "$jf" ]]; then
+    fail "$(basename "$jf") is missing — both pipelines are deliverables"
+    continue
   fi
-else
-  fail "Jenkinsfile is missing — Phase 2 deliverable"
-fi
+  jf_out="$(ecom_ci_out "jenkinsfile-$(basename "$jf").txt")"
+  if "$PY" "$ECI_LIB_DIR/check_jenkinsfile.py" "$jf" > "$jf_out" 2>&1; then
+    pass "$(basename "$jf") sanity — $(head -n 1 "$jf_out" | sed 's/^OK [^:]*: //')"
+  else
+    fail "$(basename "$jf") findings (Jenkins would reject it, or run something other than what you wrote):"
+    cat "$jf_out" >&2
+  fi
+  cat "$jf_out" >> "$jf_all"
+done
 
 step "Secrets hygiene: no committed .env / key material (blocking)"
 if git -C "$ECOM_ROOT" rev-parse --git-dir >/dev/null 2>&1; then

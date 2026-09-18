@@ -55,4 +55,4 @@ helm lint helm-charts/product
 helm template ecom helm-charts/product | kubectl apply --dry-run=client -f -
 ```
 
-Phase 2 deliberately did not add `Chart.yaml`/`templates/` until now: a chart that `helm template` renders but nothing validates is worse than an empty directory. Now that this directory has templates, add a `helm template | kubectl apply --dry-run=client` step to `scripts/ci/lint.sh` and to the Jenkinsfile `Lint` stage in the same commit (Phase 4).
+Phase 2 deliberately did not add `Chart.yaml`/`templates/` until now: a chart that `helm template` renders but nothing validates is worse than an empty directory. Now that this directory has templates, add a `helm template | kubectl apply --dry-run=client` step to `scripts/ci/lint.sh` — which is what the `Lint` stage of both `Jenkinsfile.local` and `Jenkinsfile.aws` runs — in the same commit (Phase 4).

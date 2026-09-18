@@ -2,8 +2,8 @@
 # shellcheck shell=bash
 # ---------------------------------------------------------------------------
 # scripts/ci/lib/services.sh — single source of truth for the service registry
-# used by every CI script (lint, build, scan, smoke, gitops-bump) and by the
-# Jenkinsfile parallel matrix.
+# used by every CI script (lint, build, scan, smoke, gitops-bump) and therefore by
+# both pipelines (Jenkinsfile.local, Jenkinsfile.aws) — neither restates this list.
 #
 # Fields (pipe separated), in build order:
 #   name | port | gateway prefix | data dependency | tier

@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Jenkinsfile sanity checker (stdlib, no JVM, no Jenkins).
 
-A `Jenkinsfile` cannot be linted by Jenkins until a build actually runs, which is a
-slow feedback loop for a 400-line Groovy file. This catches the four mistakes that
-account for most of the pain:
+A pipeline cannot be linted by Jenkins until a build actually runs, which is a slow
+feedback loop for a Groovy file. This catches the mistakes that account for most of
+the pain, in both `Jenkinsfile.local` and `Jenkinsfile.aws`:
 
   1. unbalanced { } [ ] ( )  — including inside strings/comments, where they must not count
   2. a `${params.x}` / `${env.x}` written inside a *single*-quoted Groovy string, where
      Groovy does not interpolate and the shell receives the literal text (silently empty)
   3. a declarative stage name that a `when { beforeAgent }` or a report glob depends on
-     disappearing or being renamed
+     disappearing or being renamed (the stage list is per pipeline, see PIPELINE_STAGES)
   4. Groovy `def`/helper methods declared outside the `pipeline { }` block, which the
      declarative parser rejects with a confusing error
+  5. credential material interpolated by Groovy, or handed to a command as a literal
+  6. the cloud pipeline reaching for kubectl/helm/terraform — ArgoCD owns that cluster
+  7. a `script { }` block — these pipelines are declarative only
 
 Exit 0 = looks sane · 1 = findings. Line numbers are reported for every finding.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 
@@ -25,8 +29,26 @@ OPEN = {"{": "}", "[": "]", "(": ")"}
 CLOSE = {v: k for k, v in OPEN.items()}
 
 REQUIRED_BLOCKS = ("pipeline {", "agent ", "stages {", "post {", "environment {", "parameters {", "options {")
-REQUIRED_STAGES = ("stage('Prepare')", "stage('Lint')", "stage('Unit tests')", "stage('Build & push')",
-                   "stage('Trivy security gate')", "stage('Promote images')", "stage('GitOps bump')")
+
+# There are two pipelines, and they are allowed to be different: the local one
+# deploys to Kind, the AWS one hands over to ArgoCD and must never touch a
+# cluster. Anything not listed here only has to lint and test.
+PIPELINE_STAGES = {
+    "jenkinsfile.local": ("stage('Prepare')", "stage('Lint')", "stage('Unit tests')",
+                          "stage('Build images')", "stage('Smoke test')", "stage('Trivy scan')",
+                          "stage('Deploy to Kind')", "stage('Verify deployment')"),
+    "jenkinsfile.aws": ("stage('Prepare')", "stage('Lint')", "stage('Unit tests')",
+                        "stage('Build & push')", "stage('Trivy security gate')",
+                        "stage('Promote images')", "stage('GitOps bump')"),
+}
+COMMON_STAGES = ("stage('Lint')", "stage('Unit tests')")
+# Deploy verbs that have no business appearing in the cloud pipeline (rule 6).
+CLUSTER_VERBS = re.compile(r"\bkubectl\b|helm\s+(?:upgrade|install|rollback)|terraform\s+\S*\s*apply")
+
+
+def stages_for(path: str) -> tuple[str, ...]:
+    """The stage contract for this pipeline, chosen by file name."""
+    return PIPELINE_STAGES.get(os.path.basename(path).lower(), COMMON_STAGES)
 
 
 def scan(text: str):
@@ -140,9 +162,9 @@ def check(path: str) -> list[str]:
     for block in REQUIRED_BLOCKS:
         if block not in text:
             findings.append(f"{path}:0: missing `{block}` block (declarative pipeline shape)")
-    for stage in REQUIRED_STAGES:
+    for stage in stages_for(path):
         if stage not in text:
-            findings.append(f"{path}:0: missing {stage} — README §4.5 and the JUnit globs name it")
+            findings.append(f"{path}:0: missing {stage} — README §5 and the JUnit globs name it")
 
     # 4) top-level Groovy methods outside pipeline { }
     head = text.split("pipeline {", 1)
@@ -170,6 +192,28 @@ def check(path: str) -> list[str]:
             findings.append(f"{path}:{lineno}: credential passed as a literal argument — "
                             f"pipe it into `--password-stdin` (a token in argv is readable via `ps` "
                             f"and lands in the build log)")
+
+    # 6) the cloud pipeline hands over to ArgoCD; it must not deploy by itself.
+    #    A build box with cluster credentials is a much bigger blast radius than a
+    #    build box with a registry login, and "CI never deploys" is only true if
+    #    something fails the build when CI tries.
+    if os.path.basename(path).lower() == "jenkinsfile.aws":
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            if raw.strip().startswith(("//", "*", "/*")):
+                continue
+            if CLUSTER_VERBS.search(raw):
+                findings.append(f"{path}:{lineno}: the AWS pipeline must not deploy — ArgoCD "
+                                f"reconciles from git after the GitOps bump (drop the "
+                                f"kubectl/helm/terraform call, or move it to Jenkinsfile.local)")
+
+    # 7) declarative only. A `script { }` block is where a pipeline stops being
+    #    readable — and everything these two need (values, conditions, credentials)
+    #    has a declarative form. Logic that really is needed belongs in scripts/ci/.
+    for m in re.finditer(r"^\s*script\s*\{", text, re.M):
+        lineno = text.count("\n", 0, m.start()) + 1
+        findings.append(f"{path}:{lineno}: `script {{ }}` block — keep the pipeline declarative "
+                        f"(environment/when/withCredentials cover it, or move the logic into "
+                        f"scripts/ci/ or the Makefile)")
     return findings
 
 
