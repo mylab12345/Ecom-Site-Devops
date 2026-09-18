@@ -320,6 +320,23 @@ Plan adjustments made during implementation, with reasons:
 - Added a smoke stage (run image → `/health` 200) between load and push: a Dockerfile that
   builds but cannot boot is the most expensive class of failure to discover at 3 a.m.
 
+What this working environment proved, and what it could not:
+
+- **Proven here** (no docker daemon, no JVM): `make ci` end to end — 198 passing tests
+  (115 structure + 83 app), ruff over 55 modules, `bash -n` over 11 scripts, YAML/tab
+  parse, the Jenkinsfile checker, secrets hygiene. And the GitOps bump against a *real*
+  second writer: two clones pushing one bare remote, where disjoint bumps replay with no
+  lost tag and a conflicting tag is refused with the agent workspace restored
+  (`jenkins/setup.md` §9). `--dry-run` produced a `git apply`-clean patch for all ten charts.
+- **Needs the tools before it is believed**: `build.sh`, `smoke.sh`, `scan.sh` were never
+  executed — this sandbox has no buildx, no daemon and no trivy binary, so multi-arch
+  push, manifest-list verification and the CVE gate are unrun. Each exits **3**, never a
+  simulated pass, so a machine without them fails loudly.
+- **Loaded by Jenkins, not by us**: the `Jenkinsfile` cannot be parsed here, so it is
+  checked offline by `scripts/ci/lib/check_jenkinsfile.py` (delimiter balance, the stage
+  contract, and the two Groovy interpolation traps that parse fine and break at runtime).
+  The first real parse is step one of the runbook in `jenkins/setup.md` §8.
+
 **Local test:**
 ```bash
 docker buildx create --name multi --use          # build.sh does this, idempotently

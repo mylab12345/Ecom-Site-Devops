@@ -315,6 +315,11 @@ values-file problem. Three runs, each isolating one class of failure.
 
 ## 9. Failure → cause → fix
 
+Both bump-recovery rows below were rehearsed against a second writer (two clones
+pushing into one bare remote): disjoint bumps replay cleanly and neither tag is
+lost; a conflicting one aborts the rebase, leaves the remote untouched and restores
+the agent workspace to the SHA it started from.
+
 | Symptom | Cause | Fix |
 |---|---|---|
 | `unknown service(s): x` | typo in `SERVICES` | names come from `scripts/ci/lib/services.sh`; `build.sh --list-services` prints them |
@@ -327,6 +332,8 @@ values-file problem. Three runs, each isolating one class of failure.
 | `expected N manifest lines, got M` | a parallel branch wrote the wrong `--images-file` | never edit that path by hand; it is derived per service in `Jenkinsfile` |
 | `helm-charts/<svc>/values.yaml has an image: block this tool will not rewrite` | someone hand-edited the stub into an unexpected shape | restore the 3-line `image:` mapping (see `helm-charts/product/values.yaml`) — refusing to write is intentional |
 | bump pushes nothing, "already current" | tag unchanged (rebuild of the same commit) | expected; it is idempotent by design |
+| `push rejected — replaying the bump on top of origin/gitops/main` and the build still goes green | a human or another branch's build moved the branch mid-run | no action: the rewrite is deterministic, so `gitops-bump.sh` replayed it. Confirm both bumps landed: `git log --oneline origin/gitops/main \| head` |
+| `rebase onto origin/gitops/main failed — most likely two bumps touched the same image.tag` | two builds disagree about which SHA a service should run | the loser's own commit is still valid — re-run `make gitops-bump PUSH=1` with that build's `.ci-output/images.txt`, or hand-edit. Auto-resolving is deliberately impossible: whichever tag you pick, a deployment silently disagrees with a green build |
 | `ERROR: The project … cannot be built` (GitHub) | hook not firing | §7 verify `curl -X POST …/github-webhook/` |
 | build is green but nothing deployed | correct for Phase 2 | deploys start in Phase 4/5 (Helm + ArgoCD) |
 
