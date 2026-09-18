@@ -1,0 +1,38 @@
+region         = "us-east-1"
+project        = "ecom"
+environment    = "dev"
+cluster_name   = "ecom-eks-graviton"
+cluster_version = "1.29"
+
+vpc_cidr       = "10.0.0.0/16"
+az_count       = 3
+
+enable_nat_gateway = true
+single_nat_gateway = true # true for dev cost saving, false for prod HA
+
+enable_spot = true
+graviton_instance_types = ["m7g.medium", "m6g.medium", "m7g.large", "m6g.large"]
+critical_instance_types = ["m7g.large", "m6g.large", "m7g.xlarge"]
+
+critical_desired_size  = 2
+stateless_desired_size = 3
+
+capacity_type_critical  = "ON_DEMAND"
+capacity_type_stateless = "SPOT"
+
+ami_type  = "AL2_ARM_64"
+disk_size = 50
+
+create_eks = true
+enable_irsa = true
+enable_ebs_csi = true
+enable_cluster_autoscaler = true
+
+tags = {
+  Owner       = "platform-team"
+  CostCenter  = "ecom-platform"
+  Team        = "platform"
+  ManagedBy   = "terraform"
+  Phase       = "3"
+  Arch        = "arm64"
+}

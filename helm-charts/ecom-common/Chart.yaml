@@ -1,0 +1,20 @@
+apiVersion: v2
+name: ecom-common
+description: Shared library chart for ecom microservices — labels, probes, security, scheduling, PDB, HPA helpers
+type: library
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - ecom
+  - microservices
+  - library
+  - graviton
+  - arm64
+home: https://github.com/mylab12345/Ecom-Site-Devops
+sources:
+  - https://github.com/mylab12345/Ecom-Site-Devops
+maintainers:
+  - name: platform-team
+    email: platform@ecom.local
+annotations:
+  category: library

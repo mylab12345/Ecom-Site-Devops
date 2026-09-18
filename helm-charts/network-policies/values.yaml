@@ -1,0 +1,93 @@
+# network-policies values — Phase 4
+# Default-deny + explicit allow edges matching the smoke test topology.
+# Ports come from scripts/ci/lib/services.sh — if Phase 4 needs a hop gateway doesn't make, service code changes first.
+
+replicaCount: 1 # not used, but kept for consistency
+
+image:
+  repository: docker.io/mylab12345/ecom-network-policies
+  tag: "0.0.0+phase1-placeholder"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Global toggle
+enabled: true
+
+# Default deny all ingress in ecom namespace
+defaultDeny:
+  enabled: true
+  policyTypes:
+    - Ingress
+    - Egress
+
+# Allow DNS (kube-dns/coredns) for all pods
+allowDNS:
+  enabled: true
+
+# Gateway as edge: ingress -> gateway:8080
+gateway:
+  enabled: true
+  port: 8080
+  from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+          - 169.254.0.0/16
+
+# Per-service edges: gateway -> services
+# These match the topology in README and tests/test_service_contracts.py gateway ROUTES table
+edges:
+  identity:
+    port: 8001
+    from: [gateway]
+  product:
+    port: 8002
+    from: [gateway, inventory, cart, order, review]
+  inventory:
+    port: 8003
+    from: [gateway, order]
+  cart:
+    port: 8004
+    from: [gateway, order]
+  order:
+    port: 8005
+    from: [gateway, payment, shipping]
+  payment:
+    port: 8006
+    from: [gateway, order]
+  shipping:
+    port: 8007
+    from: [gateway, order]
+  notification:
+    port: 8008
+    from: [gateway, order, payment, shipping]
+  review:
+    port: 8009
+    from: [gateway]
+  gateway:
+    port: 8080
+    from: [ingress-nginx]
+
+# Infra edges: services -> postgres, redis, rabbitmq
+infra:
+  postgres:
+    port: 5432
+    clients: [identity, product, inventory, order, payment, shipping, notification, review]
+  redis:
+    port: 6379
+    clients: [cart]
+  rabbitmq:
+    port: 5672
+    clients: [notification, order]
+    managementPort: 15672
+
+# Namespace
+namespace: ecom
+
+# Labels
+commonLabels: {}

@@ -1,0 +1,26 @@
+apiVersion: v2
+name: review
+description: E-Commerce review microservice — 8009 — stateless tier — Graviton ARM64
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - ecom
+  - review
+  - microservices
+  - graviton
+  - stateless
+home: https://github.com/mylab12345/Ecom-Site-Devops
+sources:
+  - https://github.com/mylab12345/Ecom-Site-Devops
+dependencies:
+  - name: ecom-common
+    version: 0.1.0
+    repository: file://../ecom-common
+maintainers:
+  - name: platform-team
+    email: platform@ecom.local
+annotations:
+  ecom.platform/service: review
+  ecom.platform/port: "8009"
+  ecom.platform/tier: stateless

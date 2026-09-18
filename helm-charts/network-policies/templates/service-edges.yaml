@@ -1,0 +1,47 @@
+{{- if .Values.enabled }}
+{{- range $svc, $cfg := .Values.edges }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "network-policies.fullname" $ }}-{{ $svc }}-from-gateway
+  namespace: {{ $.Values.namespace }}
+  labels:
+    {{- include "network-policies.labels" $ | nindent 4 }}
+    ecom.service: {{ $svc }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: {{ $svc }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- range $from := $cfg.from }}
+    {{- if eq $from "gateway" }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gateway
+      ports:
+        - protocol: TCP
+          port: {{ $cfg.port }}
+    {{- else if eq $from "ingress-nginx" }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: {{ $cfg.port }}
+    {{- else }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: {{ $from }}
+      ports:
+        - protocol: TCP
+          port: {{ $cfg.port }}
+    {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

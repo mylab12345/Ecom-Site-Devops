@@ -1,12 +1,6 @@
-# helm-charts/inventory/values.yaml — Phase 2 contract stub.
-#
-# Only the image block is owned by CI: scripts/ci/gitops-bump.sh rewrites
-# `image.repository` + `image.tag` after build.sh pushes a multi-arch image, and
-# ArgoCD (Phase 5) syncs on that commit. Phase 4 turns this stub into the full
-# chart (deployment/service/ingress/HPA/NetworkPolicy); keep the two image keys
-# and their 2-space indentation or the bump refuses to write.
-#
-# Do NOT hand-edit image.* — change the deployment, the pipeline bumps the tag.
+# helm-charts/inventory/values.yaml — Phase 4 production chart.
+# CI owns only image.repository + image.tag (2-space indentation must stay).
+# ArgoCD syncs on tag bump. Do NOT hand-edit image.* — pipeline bumps it.
 
 replicaCount: 2
 
@@ -15,14 +9,50 @@ image:
   tag: "0.0.0+phase1-placeholder"
   pullPolicy: IfNotPresent
 
-# Container + Service port. Mirrors services/inventory/Dockerfile EXPOSE and the
-# registry in scripts/ci/lib/services.sh (tests/test_ci_hygiene.py enforces it).
+nameOverride: ""
+fullnameOverride: ""
+
 service:
   type: ClusterIP
   port: 8003
   targetPort: 8003
+  annotations: {}
 
 containerPort: 8003
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsUser: 1000
+
+podLabels: {}
+podAnnotations: {}
+commonLabels: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
 
 probes:
   readiness:
@@ -41,14 +71,53 @@ metrics:
   path: /metrics
   port: 8003
 
-# Env is assembled from a ConfigMap in Phase 4; secrets come from SOPS/Vault and
-# are referenced by name here — never by value.
 config:
   SERVICE_NAME: "inventory-service"
   LOG_LEVEL: "info"
   INTERNAL_TOKEN_SECRET_REF: "ecom-internal-token"
-# Phase 3 fills these from terraform outputs (node selectors for spot pools).
+  DATABASE_URL: "postgresql://ecom:ecom123@postgres:5432/inventory_db"
+  PRODUCT_SERVICE_URL: "http://product:8002"
+
+extraConfig: {}
+extraEnv: []
+envSecrets: []
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
 scheduling:
-  architecture: arm64            # Graviton (m7g/m6g); amd64 images are built too
+  architecture: arm64
   spotCapable: true
   priorityClass: ecom-best-effort
+
+nodeSelector: {}
+tolerations: []
+topologySpreadConstraints: []
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+  hosts:
+    - host: ecom.local
+      paths:
+        - path: /api/inventory(|$)(.*)
+          pathType: Prefix
+  tls: []
+
+networkPolicy:
+  enabled: true
+  extraIngress: []
+  extraEgress: []
+
+serviceMonitor:
+  enabled: false

@@ -1,0 +1,22 @@
+Ingress NGINX {{ .Chart.AppVersion }} deployed via wrapper chart.
+
+1. Verify controller:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=controller
+  kubectl get svc -n {{ .Release.Namespace }} ingress-nginx-controller
+
+2. For AWS EKS:
+  kubectl get svc ingress-nginx-controller -n {{ .Release.Namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+  # Point ecom.local or your domain to this LB
+
+3. For Kind local:
+  helm upgrade --install ingress-nginx ./helm-charts/ingress-nginx -n ingress-nginx --create-namespace \
+    --set ingress-nginx-upstream.controller.service.type=NodePort \
+    --set ingress-nginx-upstream.controller.hostPort.enabled=true
+  # Then curl http://localhost:80/ or http://ecom.local (add to /etc/hosts)
+
+4. Gateway is the only entrypoint:
+  curl http://<LB>/api/products/health -> gateway:8080 -> product:8002
+  curl http://<LB>/health -> gateway aggregated health
+
+5. ARM64: image registry.k8s.io/ingress-nginx/controller:v1.10.0 is multi-arch (amd64+arm64)
+

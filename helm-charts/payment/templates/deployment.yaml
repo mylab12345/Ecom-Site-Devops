@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "payment.fullname" . }}
+  labels:
+    {{- include "payment.labels" . | nindent 4 }}
+  annotations:
+    ecom.platform/version: {{ .Chart.AppVersion | quote }}
+    ecom.platform/tier: critical
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "payment.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "payment.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ include "payment.fullname" . }}
+        eci.service: payment
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        prometheus.io/scrape: "{{ .Values.metrics.enabled }}"
+        prometheus.io/port: "{{ .Values.metrics.port }}"
+        prometheus.io/path: "{{ .Values.metrics.path }}"
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "payment.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      priorityClassName: {{ .Values.scheduling.priorityClass | quote }}
+      terminationGracePeriodSeconds: 30
+      {{- with (include "payment.nodeSelector" . | trim) }}
+      nodeSelector:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with (include "payment.tolerations" . | trim) }}
+      tolerations:
+        {{- . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        {{- include "payment.topologySpreadConstraints" . | nindent 8 }}
+      containers:
+        - name: payment
+          image: {{ include "payment.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "payment.fullname" . }}
+          env:
+            {{- include "payment.extraEnv" . | nindent 12 }}
+            {{- if .Values.envSecrets }}
+            {{- range .Values.envSecrets }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey }}
+            {{- end }}
+            {{- end }}
+          livenessProbe:
+            {{- include "payment.probes.liveness" . | nindent 12 }}
+          readinessProbe:
+            {{- include "payment.probes.readiness" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
