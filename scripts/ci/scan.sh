@@ -16,6 +16,7 @@
 #   --severity LIST      default HIGH,CRITICAL                  ($TRIVY_SEVERITY)
 #   --mode gate|report   gate = fail on findings; report = always 0
 #   --ignore-unfixed     on by default               ($TRIVY_IGNORE_UNFIXED)
+#   TRIVY_INSECURE=1     allow a plain-HTTP registry (Kind's localhost:5001)
 #   --services LIST --tag T --registry R   derive refs from the CI registry
 #   --image REF          repeatable; scan exactly these refs
 #   --fs                 also scan the repo
@@ -86,6 +87,10 @@ fi
 TRIVY_ARGS=(--severity "$SEVERITY" --timeout "$TIMEOUT" --parallel 1)
 [[ -f "$ECOM_ROOT/.trivyignore" ]] && TRIVY_ARGS+=(--ignorefile "$ECOM_ROOT/.trivyignore")
 [[ "$IGNORE_UNFIXED" == "1" ]] && TRIVY_ARGS+=(--ignore-unfixed)
+# A plain-HTTP registry (Kind's localhost:5001, a LAN mirror) needs --insecure, or
+# trivy fails the pull with an x509 error and the "gate" reports a scan error
+# instead of a verdict. Off by default: docker.io/EKS registries are TLS.
+[[ "${TRIVY_INSECURE:-0}" == "1" ]] && TRIVY_ARGS+=(--insecure)
 export ECI_SEVERITY="$SEVERITY"
 
 # --- DB warm-up -------------------------------------------------------------

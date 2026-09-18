@@ -4,7 +4,9 @@ Per-namespace `NetworkPolicy` objects, one file per edge, default-deny in. Phase
 
 ## Topology (from Phase 2, enforced by tests)
 
-Phase 2 fixes the topology these must match, because smoke test in pipeline (`Jenkinsfile` → `E2E smoke test`) already exercises exactly these hops:
+CI fixes the topology these must match, because the `Verify deployment` stage of
+`Jenkinsfile.local` runs `scripts/test.sh` through the ingress and therefore exercises
+exactly these hops (a policy that blocks one of them turns that stage red):
 
 ```
 ingress → gateway:8080

@@ -25,7 +25,12 @@ SERVICES_DIR = REPO_ROOT / "services"
 CHARTS_DIR = REPO_ROOT / "helm-charts"
 CI_DIR = REPO_ROOT / "scripts" / "ci"
 CHECK_JENKINSFILE = CI_DIR / "lib" / "check_jenkinsfile.py"
-JENKINSFILE = REPO_ROOT / "Jenkinsfile"
+# Two deliberately simple pipelines: one builds/deploys locally (Kind), one builds
+# for AWS and hands over to ArgoCD. The stage contract lives in the checker
+# (scripts/ci/lib/check_jenkinsfile.py: PIPELINE_STAGES) and is asserted per file.
+JENKINSFILE_LOCAL = REPO_ROOT / "Jenkinsfile.local"
+JENKINSFILE_AWS = REPO_ROOT / "Jenkinsfile.aws"
+JENKINSFILES = (JENKINSFILE_LOCAL, JENKINSFILE_AWS)
 REGISTRY_FILE = CI_DIR / "lib" / "services.sh"
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yaml"
 GATEWAY_CONFIG = SERVICES_DIR / "gateway" / "app" / "config.py"

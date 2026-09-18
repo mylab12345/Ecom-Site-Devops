@@ -2,7 +2,7 @@
         ci ci-deps ci-lint ci-test ci-test-docker ci-build ci-push ci-scan ci-smoke ci-all ci-clean \
         gitops-bump gitops-dry ci-plan doctor \
         tf-fmt tf-validate tf-plan-local tf-apply-local tf-destroy-local tf-plan-eks tf-apply-eks \
-        helm-lint helm-template helm-deps kind-up kind-down eks-kubeconfig \
+        helm-lint helm-template helm-deps kind-up kind-down kind-kubeconfig eks-kubeconfig \
         helm-install-local helm-uninstall-local \
         argocd-install argocd-admin-pass argocd-apps argocd-status argocd-sync \
         obs-up obs-down obs-jaeger obs-prometheus obs-loki obs-security trivy-scan-cluster
@@ -134,6 +134,9 @@ tf-apply-eks: ## Apply EKS Graviton (needs AWS creds)
 kind-up: tf-apply-local ## Alias for local Kind up
 kind-down: tf-destroy-local ## Alias for Kind down
 
+kind-kubeconfig: ## Print the Kind kubeconfig path (terraform output, else ~/.kube/config)
+	@terraform -chdir=terraform/local-kind output -raw kubeconfig_path 2>/dev/null || echo "$${HOME}/.kube/config"
+
 eks-kubeconfig: ## Configure kubectl for EKS (needs AWS creds + cluster exists)
 	@aws eks update-kubeconfig --region $${AWS_REGION:-us-east-1} --name $${CLUSTER_NAME:-ecom-eks-graviton}
 
@@ -159,9 +162,9 @@ helm-template: ## Render all charts (dry-run, no cluster needed)
 	@helm template network-policies helm-charts/network-policies -n ecom > .ci-output/helm/network-policies.yaml || true
 	@echo "helm template OK — rendered to .ci-output/helm/"
 
-helm-install-local: ## Install all charts to Kind (needs KUBECONFIG from tf-apply-local)
+helm-install-local: ## Install all charts to Kind (IMAGE_TAG=local by default; Jenkinsfile.local passes its own)
 	@for svc in identity product inventory cart order payment shipping notification review gateway; do \
-	  helm upgrade --install $$svc ./helm-charts/$$svc -n ecom --create-namespace --set image.repository=localhost:5001/ecom-$$svc --set image.tag=local; \
+	  helm upgrade --install $$svc ./helm-charts/$$svc -n ecom --create-namespace --set image.repository=localhost:5001/ecom-$$svc --set image.tag=$(or $(IMAGE_TAG),local); \
 	done
 	@helm upgrade --install ingress-nginx ./helm-charts/ingress-nginx -n ingress-nginx --create-namespace \
 	  --set ingress-nginx-upstream.controller.service.type=NodePort \

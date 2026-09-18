@@ -23,6 +23,9 @@ from conftest import (
     COMPOSE_FILE,
     GATEWAY_CONFIG,
     INFRA_SERVICES,
+    JENKINSFILES,
+    JENKINSFILE_AWS,
+    JENKINSFILE_LOCAL,
     REPO_ROOT,
     REGISTRY,
     REGISTRY_FILE,
@@ -67,7 +70,7 @@ def test_registry_covers_every_service_directory():
 def test_registry_file_is_the_single_source_of_truth():
     """No script or pipeline may keep its own copy of the service list."""
     offenders = []
-    for script in (*sorted(CI_DIR.glob("*.sh")), REPO_ROOT / "Jenkinsfile"):
+    for script in (*sorted(CI_DIR.glob("*.sh")), *JENKINSFILES):
         if not script.exists():
             continue
         text = script.read_text(encoding="utf-8")
@@ -247,56 +250,105 @@ def test_helm_values_placeholders_for_later_phases():
 
 
 # ── Jenkinsfile ↔ scripts contract ─────────────────────────────────────────
-JENKINSFILE = REPO_ROOT / "Jenkinsfile"
-REQUIRED_STAGES = ["Prepare", "Lint", "Unit tests", "Build & push", "Trivy security gate",
-                   "Promote images", "GitOps bump"]
-jenkinsfile_or_skip = pytest.mark.skipif(not JENKINSFILE.exists(), reason="Jenkinsfile not written yet")
+# Two deliberately simple pipelines. `Jenkinsfile.local` builds, deploys to Kind
+# and verifies on one machine; `Jenkinsfile.aws` builds multi-arch images for EKS
+# and hands the rollout to ArgoCD. Both must stay readable in one sitting — the
+# cleverness lives in scripts/ci/, which is also what `make ci-all` runs.
+LOCAL_STAGES = ["Prepare", "Lint", "Unit tests", "Build images", "Smoke test",
+                "Trivy scan", "Deploy to Kind", "Verify deployment"]
+AWS_STAGES = ["Prepare", "Lint", "Unit tests", "Build & push", "Trivy security gate",
+              "Promote images", "GitOps bump"]
+PIPELINES = [(JENKINSFILE_LOCAL, LOCAL_STAGES), (JENKINSFILE_AWS, AWS_STAGES)]
+PIPELINE_IDS = [p.name for p, _ in PIPELINES]
+CI_SCRIPTS_CALLED = ("scripts/ci/lint.sh", "scripts/ci/unit-tests.sh", "scripts/ci/build.sh",
+                     "scripts/ci/smoke.sh", "scripts/ci/scan.sh")
 
 
-@jenkinsfile_or_skip
-def test_jenkinsfile_delegates_to_the_ci_scripts():
-    text = JENKINSFILE.read_text(encoding="utf-8")
-    for script in ("scripts/ci/lint.sh", "scripts/ci/unit-tests.sh", "scripts/ci/build.sh",
-                   "scripts/ci/scan.sh", "scripts/ci/gitops-bump.sh"):
-        assert script in text, f"Jenkinsfile must call {script} — laptop/CI parity is the whole point"
+def pipeline_text(pipeline) -> str:
+    assert pipeline.is_file(), f"{pipeline.name} is missing — both pipelines are deliverables"
+    return pipeline.read_text(encoding="utf-8")
+
+
+def code_only(text: str) -> str:
+    """Drop comment lines, so an assertion about what a pipeline *does* is not
+    satisfied by a sentence about what it does not do."""
+    return "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith(("//", "*", "/*")))
+
+
+@pytest.mark.parametrize(("pipeline", "stages"), PIPELINES, ids=PIPELINE_IDS)
+def test_pipeline_declares_its_stages_and_the_declarative_blocks(pipeline, stages):
+    text = pipeline_text(pipeline)
+    for stage in stages:
+        assert f"stage('{stage}')" in text, f"{pipeline.name} is missing stage('{stage}')"
+    for block in ("agent", "options", "environment", "parameters", "post"):
+        assert re.search(rf"\b{block}\s*\{{", text), f"{pipeline.name} should declare a {block} block"
+    assert "placeholder" not in text, f"{pipeline.name} is still the Phase 1 scaffold"
+    assert "echo 'trivy scan'" not in text, f"{pipeline.name} fakes a stage instead of running it"
+    assert "timeout(" in text, "agents hang; a pipeline without a timeout parks an executor forever"
+
+
+@pytest.mark.parametrize(("pipeline", "stages"), PIPELINES, ids=PIPELINE_IDS)
+def test_pipeline_delegates_to_the_ci_scripts(pipeline, stages):
+    """Laptop/CI parity is the whole point: a stage is one call into scripts/ci/."""
+    text = code_only(pipeline_text(pipeline))
+    for script in CI_SCRIPTS_CALLED:
+        assert script in text, f"{pipeline.name} must call {script}"
     assert not re.search(r"docker\s+buildx\s+build\b", text), (
-        "Jenkinsfile must not inline a `docker buildx build`; that lives in scripts/ci/build.sh"
+        f"{pipeline.name} must not inline a `docker buildx build`; that lives in scripts/ci/build.sh"
     )
 
 
-@jenkinsfile_or_skip
-@pytest.mark.parametrize("stage", REQUIRED_STAGES)
-def test_jenkinsfile_declares_every_phase2_stage(stage):
-    text = JENKINSFILE.read_text(encoding="utf-8")
-    assert f"stage('{stage}')" in text, f"Jenkinsfile is missing stage('{stage}')"
+@pytest.mark.parametrize(("pipeline", "stages"), PIPELINES, ids=PIPELINE_IDS)
+def test_pipeline_stays_simple_enough_to_read(pipeline, stages):
+    lines = pipeline_text(pipeline).splitlines()
+    assert len(lines) <= 200, f"{pipeline.name} is {len(lines)} lines — keep it under 200 or move logic into scripts/ci/"
+    text = code_only(pipeline_text(pipeline))
+    assert "parallel" not in text, f"{pipeline.name} should not fan out per service; build.sh already bounds concurrency"
+    assert not re.search(r"^\s*script\s*\{", text, re.M), (
+        f"{pipeline.name} must stay declarative-only — no `script {{ }}` blocks. "
+        f"environment/when/withCredentials cover the pipeline's needs, and anything "
+        f"beyond that belongs in scripts/ci/ or the Makefile"
+    )
 
 
-@jenkinsfile_or_skip
-def test_jenkinsfile_is_not_the_phase1_placeholder():
-    text = JENKINSFILE.read_text(encoding="utf-8")
-    assert "placeholder" not in text, "Jenkinsfile is still the Phase 1 scaffold"
-    assert "echo 'trivy scan'" not in text
-    for block in ("agent", "options", "environment", "parameters", "post"):
-        assert re.search(rf"\b{block}\s*\{{", text), f"Jenkinsfile should declare a {block} block"
+@pytest.mark.parametrize(("pipeline", "stages"), PIPELINES, ids=PIPELINE_IDS)
+def test_pipeline_publishes_reports_and_cleans_up(pipeline, stages):
+    text = pipeline_text(pipeline)
+    assert "junit " in text or "junit(" in text, f"{pipeline.name} must publish the JUnit reports the scripts write"
+    assert "archiveArtifacts" in text, f"{pipeline.name}: build reports must survive the workspace wipe"
+    assert "cleanWs" in text, f"{pipeline.name}: wipe the workspace so a stale tag cannot leak into the next build"
 
 
-@jenkinsfile_or_skip
-def test_jenkinsfile_publishes_reports_and_cleans_up():
-    text = JENKINSFILE.read_text(encoding="utf-8")
-    assert "junit " in text or "junit(" in text, "publish JUnit results from the test + trivy stages"
-    assert "archiveArtifacts" in text, "build reports must survive the workspace wipe"
-    assert "cleanWs" in text, "wipe the workspace so a stale tag cannot leak into the next build"
+def test_local_pipeline_builds_deploys_and_verifies():
+    text = code_only(pipeline_text(JENKINSFILE_LOCAL))
+    assert "localhost:5001" in text, "local images go to the Kind registry, never to the internet"
+    assert "make helm-install-local" in text, "the local pipeline must deploy what it just built"
+    assert re.search(r"rollout status|wait --for=condition=", text), (
+        "…wait for the rollout instead of trusting `helm upgrade` returning 0"
+    )
+    assert "scripts/test.sh" in text, "…and prove the deployed stack works end to end"
+    assert "docker login" not in text, "the local registry is unauthenticated; a login step here is a smell"
+
+
+def test_aws_pipeline_publishes_images_and_hands_over_to_gitops():
+    text = code_only(pipeline_text(JENKINSFILE_AWS))
+    assert "scripts/ci/gitops-bump.sh" in text, "the AWS pipeline's last act is a commit, not a deploy"
     assert "docker login" in text, "registry creds must be scoped to the build"
-    assert "docker logout" in text, "…and removed again: a lingering auths file outlives the build"
-    assert "timeout(" in text, "agents hang; a pipeline without a timeout parks an executor forever"
-    assert "retry(" in text, "registries flake; retry belongs on the push, not on the whole build"
-
-
-@jenkinsfile_or_skip
-def test_jenkinsfile_gitops_stage_is_branch_guarded():
-    text = JENKINSFILE.read_text(encoding="utf-8")
+    assert "--password-stdin" in text, "…and never passed as an argument (readable via `ps`, echoed in the log)"
+    assert "docker logout" in text, "…then removed again: a lingering auths file outlives the build"
+    assert "retry(" in text, "registries flake; the retry belongs on the push, not on the whole build"
     assert "GITOPS_ENABLED" in text, "the bump must be toggleable"
     assert re.search(r"BRANCH_NAME|env\.GIT_BRANCH", text), "the bump must be limited to the trunk branch"
+
+
+def test_aws_pipeline_never_touches_the_cluster():
+    """ArgoCD owns the rollout (README §6). A build box holding cluster
+    credentials is a far bigger blast radius than one holding a registry login,
+    so the invariant is enforced here rather than remembered."""
+    text = code_only(pipeline_text(JENKINSFILE_AWS))
+    assert not re.search(r"\bkubectl\b|helm\s+(?:upgrade|install|rollback)|terraform\s+\S*\s*apply", text), (
+        "Jenkinsfile.aws must not deploy — commit the image tags and let ArgoCD reconcile"
+    )
 
 
 # ── docs & configuration surface ────────────────────────────────────────────

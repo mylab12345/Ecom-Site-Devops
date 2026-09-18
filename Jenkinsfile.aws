@@ -1,0 +1,175 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Jenkinsfile.aws — build for AWS (EKS on Graviton) and hand over to ArgoCD
+//
+//    Prepare → Lint → Unit tests → Build & push → Trivy security gate
+//            → Promote images → GitOps bump
+//
+//  How to read this file: it is declarative Jenkins only — no `script { }` block,
+//  no Groovy logic, no fan-out. Every stage is ONE shell command that calls a
+//  script from scripts/ci/, so a red stage is reproducible on a laptop with
+//  `make ci-all` / `bash scripts/ci/all.sh`.
+//
+//  Two rules make the pipeline trustworthy, and both are visible below:
+//    1. Images are published under a candidate tag — the 12-char git SHA that
+//       build.sh derives itself (scan.sh and --promote derive the same one, so it
+//       cannot drift between stages). Only the Promote stage ever writes `latest`,
+//       and it retags inside the registry, so a `latest` that skipped the security
+//       gate cannot exist.
+//    2. Jenkins never deploys. The last stage commits two lines per service
+//       (image.repository, image.tag) to gitops/main and ArgoCD rolls it out.
+//       A rollback is `git revert`, not "replay build #7".
+//
+//  Jenkins job: Multibranch Pipeline (or Pipeline from SCM) → Script Path
+//               Jenkinsfile.aws
+//  Agent label 'ecom-buildx': docker, buildx + QEMU/binfmt (arm64), trivy,
+//               python3, git. Setup, plugins and timings: jenkins/setup.md
+//  Credentials: dockerhub-creds (registry push) · gitops-token (push gitops/main)
+//  Local pipeline: Jenkinsfile.local
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+  agent { label 'ecom-buildx' }
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()            // the buildx cache and binfmt do not share well
+    timeout(time: 75, unit: 'MINUTES')   // arm64 under QEMU emulation is slow
+    buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+  }
+
+  parameters {
+    string(name: 'REGISTRY',      defaultValue: 'docker.io/mylab12345', description: 'Registry namespace the images are pushed to')
+    string(name: 'SERVICES',      defaultValue: 'all', description: 'all | comma list. Catalogue: scripts/ci/lib/services.sh')
+    string(name: 'PLATFORMS',     defaultValue: 'linux/amd64,linux/arm64', description: 'Keep arm64: EKS runs on Graviton')
+    string(name: 'GITOPS_BRANCH', defaultValue: 'gitops/main', description: 'Branch ArgoCD watches — deliberately not the base branch')
+    booleanParam(name: 'SCAN_GATE',      defaultValue: true, description: 'true = HIGH/CRITICAL with a released fix fails the build. false = report only.')
+    booleanParam(name: 'PROMOTE_LATEST', defaultValue: true, description: 'Retag the scanned candidate to latest (no rebuild)')
+    booleanParam(name: 'GITOPS_ENABLED', defaultValue: true, description: 'Commit the new image tags to gitops/main. Trunk builds only.')
+  }
+
+  // Every value a stage needs is declared here, so the `sh` steps below can stay
+  // single-quoted: the shell expands them, Jenkins masks the credentials, and
+  // Groovy interpolates nothing that could restructure a command line.
+  environment {
+    ECI_OUT_DIR   = "${WORKSPACE}/.ci-output"
+    DOCKER_CONFIG = "${WORKSPACE}/.docker"   // per build: executors must not share a login
+    REGISTRY      = "${params.REGISTRY}"
+    SERVICES      = "${params.SERVICES}"
+    PLATFORMS     = "${params.PLATFORMS}"
+    GITOPS_BRANCH = "${params.GITOPS_BRANCH}"
+    BUILDER_NAME  = 'ecom-buildx'
+    TRIVY_MODE    = "${params.SCAN_GATE ? 'gate' : 'report'}"
+    TRIVY_SEVERITY = 'HIGH,CRITICAL'
+    ECOM_BUILD_PARALLEL = '2'
+  }
+
+  stages {
+
+    // The declarative pipeline already checked out this branch on the agent.
+    stage('Prepare') {
+      steps {
+        sh 'make doctor'   // toolchain report; exits non-zero if a required tool is missing
+        // Create the buildx builder and register QEMU once, before any build runs.
+        sh 'bash scripts/ci/build.sh --ensure-builder-only --builder "$BUILDER_NAME"'
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                          usernameVariable: 'REG_USER',
+                                          passwordVariable: 'REG_PASS')]) {
+          // Password on stdin only: `docker login -p` would put it in the process list.
+          sh '''
+            host="${REGISTRY%%/*}"
+            case "$host" in *.*) : ;; *) host="docker.io" ;; esac
+            printf '%s' "$REG_PASS" | docker login --username "$REG_USER" --password-stdin "$host"
+          '''
+        }
+      }
+    }
+
+    stage('Lint') {
+      steps { sh 'bash scripts/ci/lint.sh' }   // ruff, bash -n, YAML, Jenkinsfile shape, secrets
+    }
+
+    stage('Unit tests') {
+      steps {
+        // Exactly what Jenkins should run: python:3.12-slim with every service's deps.
+        sh 'ECOM_TEST_DOCKER=1 ECOM_TEST_TIER=all bash scripts/ci/unit-tests.sh'
+      }
+    }
+
+    stage('Build & push') {
+      steps {
+        // 1. build for this agent's arch and load it into docker, so it can be run
+        sh 'bash scripts/ci/build.sh --load --services "$SERVICES" --builder "$BUILDER_NAME"'
+        // 2. prove each image boots and answers /health before anything is published.
+        //    No --tag on the builds: build.sh derives the candidate tag from the git
+        //    SHA, scan.sh and --promote derive the same one, and a CI checkout is
+        //    clean, so this reads the identical value.
+        sh 'bash scripts/ci/smoke.sh --services "$SERVICES" --tag "$(git rev-parse --short=12 HEAD)" --registry ""'
+        // 3. push the multi-arch manifest under that candidate tag. Same builder,
+        //    same inputs, so the layers are cached and this step mostly uploads.
+        retry(2) {   // registries flake; the retry belongs on the push, not the build
+          sh '''
+            bash scripts/ci/build.sh --push --cache \
+              --services "$SERVICES" --registry "$REGISTRY" \
+              --platforms "$PLATFORMS" --builder "$BUILDER_NAME"
+          '''
+        }
+      }
+    }
+
+    stage('Trivy security gate') {
+      steps {
+        // Scans the pushed candidate refs: exactly the bytes that will be promoted.
+        sh 'bash scripts/ci/scan.sh --services "$SERVICES" --registry "$REGISTRY" --mode "$TRIVY_MODE"'
+      }
+      post {
+        always { junit testResults: '.ci-output/junit-trivy.xml', allowEmptyResults: true, keepLongStdio: true }
+      }
+    }
+
+    stage('Promote images') {
+      when { expression { params.PROMOTE_LATEST } }
+      steps {
+        // A registry-side retag, not a rebuild: the promoted bytes are the scanned bytes.
+        sh 'bash scripts/ci/build.sh --promote --to latest --services "$SERVICES" --registry "$REGISTRY"'
+      }
+    }
+
+    stage('GitOps bump') {
+      // Trunk only: a PR build must not tell ArgoCD to roll out unreviewed code.
+      when { expression { params.GITOPS_ENABLED && (env.BRANCH_NAME ?: 'main') == 'main' } }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'gitops-token',
+                                          usernameVariable: 'GIT_USER',
+                                          passwordVariable: 'GIT_TOKEN')]) {
+          sh '''
+            slug=$(git config --get remote.origin.url | sed -E 's#^(https://|git@)([^@]*@)?github\\.com[:/]##; s#\\.git$##')
+            # gitops-bump.sh redacts user:token@ before it logs anything
+            export GIT_REMOTE_URL="https://${GIT_USER}:${GIT_TOKEN}@github.com/${slug}.git"
+            bash scripts/ci/gitops-bump.sh --push \
+              --images-file "$ECI_OUT_DIR/images.txt" \
+              --branch "$GITOPS_BRANCH" --base main
+          '''
+        }
+      }
+      post {
+        success { echo 'Image tags committed → ArgoCD reconciles. Watch it with: argocd app list' }
+        failure { echo 'Bump failed — usual causes: gitops-token lacks write scope, GITOPS_BRANCH equals the base branch, or a values file was hand-edited (the script refuses to guess).' }
+      }
+    }
+  }
+
+  post {
+    always {
+      junit testResults: '.ci-output/junit-*.xml', allowEmptyResults: true, keepLongStdio: true
+      archiveArtifacts artifacts: '.ci-output/**', allowEmptyArchive: true, excludes: '.ci-output/*.log'
+      sh '''
+        host="${REGISTRY%%/*}"
+        case "$host" in *.*) : ;; *) host="docker.io" ;; esac
+        docker logout "$host" 2>/dev/null || true
+      '''
+      cleanWs deleteDirs: true, notFailBuild: true   // a stale tag must not leak into the next build
+    }
+    success { echo 'GREEN — the candidate passed the gate and the tags are committed. ArgoCD owns the rollout from here.' }
+    failure { echo 'FAILED — open .ci-output/summary.md in the artifacts, then reproduce: bash scripts/ci/all.sh --keep-going' }
+  }
+}

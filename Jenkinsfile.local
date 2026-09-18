@@ -1,0 +1,139 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Jenkinsfile.local — build, deploy and verify on a laptop-sized machine
+//
+//    Prepare → Lint → Unit tests → Build images → Smoke test
+//            → Trivy scan → Deploy to Kind → Verify deployment
+//
+//  How to read this file: it is declarative Jenkins only — no `script { }` block,
+//  no Groovy logic, no fan-out. Every stage is ONE shell command that calls a
+//  script from scripts/ci/ or a target from the Makefile, so the same pipeline
+//  runs on your laptop:
+//
+//      make ci-all              # Prepare … Trivy scan
+//      make helm-install-local  # Deploy to Kind
+//      ./scripts/test.sh        # Verify deployment
+//
+//  Nothing leaves the machine: images are pushed to the Kind registry on
+//  localhost:5001 (terraform/local-kind creates it) and Helm installs them into
+//  the local cluster. For the cloud pipeline see Jenkinsfile.aws.
+//
+//  Jenkins job: Pipeline → "Pipeline script from SCM" → Script Path
+//               Jenkinsfile.local
+//  Agent needs: docker, buildx, python3, make, curl, jq, helm, kubectl, kind
+//               (label: ecom-local). `make doctor` prints what is missing.
+//  If docker refuses the plain-HTTP registry, add "localhost:5001" to
+//  insecure-registries in /etc/docker/daemon.json and restart the daemon.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+  agent { label 'ecom-local' }
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()            // one Kind cluster: two builds would fight over it
+    timeout(time: 40, unit: 'MINUTES')   // an agent that hangs must not park an executor
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+  }
+
+  parameters {
+    string(name: 'SERVICES',  defaultValue: 'all', description: 'all | comma list (identity,product,…). Catalogue: scripts/ci/lib/services.sh')
+    string(name: 'IMAGE_TAG', defaultValue: '',    description: 'Image tag. Empty → local-<build number>')
+    booleanParam(name: 'SCAN_GATE', defaultValue: false, description: 'true = HIGH/CRITICAL CVEs fail the build. false (default locally) = report only.')
+    booleanParam(name: 'DEPLOY',    defaultValue: true,  description: 'false = stop after the scan: build and verify images, leave the cluster alone.')
+  }
+
+  // Every value a stage needs is declared here, so the `sh` steps below can stay
+  // single-quoted: the shell expands them, Groovy interpolates nothing.
+  environment {
+    ECI_OUT_DIR = "${WORKSPACE}/.ci-output"
+    SERVICES    = "${params.SERVICES}"
+    IMAGE_TAG   = "${params.IMAGE_TAG ?: 'local-' + env.BUILD_NUMBER}"
+    REGISTRY    = 'localhost:5001'       // the registry terraform/local-kind runs
+    PLATFORMS   = 'linux/amd64'          // host arch only: Kind runs here, not on Graviton
+    BUILDER_NAME = 'ecom-buildx'
+    TRIVY_MODE   = "${params.SCAN_GATE ? 'gate' : 'report'}"
+    TRIVY_SEVERITY = 'HIGH,CRITICAL'
+    TRIVY_INSECURE = '1'                 // localhost:5001 is plain HTTP, not TLS
+    ECOM_BUILD_PARALLEL = '2'
+  }
+
+  stages {
+
+    // The declarative pipeline already checked out this branch on the agent.
+    stage('Prepare') {
+      steps {
+        sh 'make doctor'   // toolchain report; exits non-zero if a required tool is missing
+        sh 'echo "building $SERVICES → $REGISTRY:$IMAGE_TAG"'
+      }
+    }
+
+    stage('Lint') {
+      steps { sh 'bash scripts/ci/lint.sh' }   // ruff, bash -n, YAML, Jenkinsfile shape, secrets
+    }
+
+    stage('Unit tests') {
+      steps { sh 'ECOM_TEST_TIER=all bash scripts/ci/unit-tests.sh' }
+    }
+
+    stage('Build images') {
+      steps {
+        // build.sh reads the service list itself and pushes each image to $REGISTRY.
+        sh '''
+          bash scripts/ci/build.sh --push \
+            --services "$SERVICES" --tag "$IMAGE_TAG" \
+            --registry "$REGISTRY" --platforms "$PLATFORMS" --builder "$BUILDER_NAME"
+        '''
+      }
+    }
+
+    stage('Smoke test') {
+      steps {
+        // Run every image once: /health must answer 200, /metrics must be Prometheus
+        // text, X-Request-ID must come back. No Postgres/Redis needed to pass.
+        sh 'bash scripts/ci/smoke.sh --services "$SERVICES" --tag "$IMAGE_TAG" --registry "$REGISTRY"'
+      }
+    }
+
+    stage('Trivy scan') {
+      steps {
+        sh 'bash scripts/ci/scan.sh --services "$SERVICES" --tag "$IMAGE_TAG" --registry "$REGISTRY" --mode "$TRIVY_MODE"'
+      }
+      post {
+        always { junit testResults: '.ci-output/junit-trivy.xml', allowEmptyResults: true, keepLongStdio: true }
+      }
+    }
+
+    stage('Deploy to Kind') {
+      when { expression { params.DEPLOY } }
+      steps {
+        // Installs all 13 charts (10 services + ingress-nginx + network-policies)
+        // pointing at the tag this build just pushed. `make -s kind-kubeconfig`
+        // resolves the kubeconfig terraform/local-kind wrote (or ~/.kube/config).
+        sh 'export KUBECONFIG="$(make -s kind-kubeconfig)" && make helm-install-local IMAGE_TAG="$IMAGE_TAG"'
+      }
+    }
+
+    stage('Verify deployment') {
+      when { expression { params.DEPLOY } }
+      steps {
+        sh '''
+          export KUBECONFIG="$(make -s kind-kubeconfig)"
+          kubectl -n ecom wait --for=condition=Available deployment --all --timeout=180s
+          kubectl -n ecom get pods -o wide
+          # the same end-to-end script the README walks through, via the ingress
+          BASE=http://localhost:8080 bash scripts/test.sh
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      junit testResults: '.ci-output/junit-*.xml', allowEmptyResults: true, keepLongStdio: true
+      archiveArtifacts artifacts: '.ci-output/**', allowEmptyArchive: true, excludes: '.ci-output/*.log'
+      cleanWs deleteDirs: true, notFailBuild: true   // a stale tag must not leak into the next build
+    }
+    success { echo "GREEN — ${env.IMAGE_TAG} is running in Kind: curl http://localhost:8080/health" }
+    failure { echo 'FAILED — open .ci-output/summary.md in the artifacts, then reproduce: make ci-all' }
+  }
+}

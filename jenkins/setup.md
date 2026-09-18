@@ -1,8 +1,8 @@
 # Jenkins CI (Phase 2) — agent, credentials, webhooks, runbook
 
-Everything needed to turn `Jenkinsfile` into a green pipeline: what to install,
-what to click, what each stage runs, how to reproduce a failure locally, and what
-Phase 2 deliberately does **not** do.
+Everything needed to turn `Jenkinsfile.local` and `Jenkinsfile.aws` into green
+pipelines: what to install, what to click, what each stage runs, how to reproduce a
+failure locally, and what CI deliberately does **not** do.
 
 Target: Jenkins **LTS 2.440.3+**, Docker **24+**, buildx **0.13+**, on one Linux
 amd64 agent (an arm64 agent works too — see §4). ~180 lines of this file are the
@@ -14,7 +14,8 @@ amd64 agent (an arm64 agent works too — see §4). ~180 lines of this file are 
 
 | Deliverable | File | Runs |
 |---|---|---|
-| Pipeline-as-code (8 stages, per-service fan-out) | `Jenkinsfile` | Jenkins |
+| Pipeline-as-code, **local**: build → deploy to Kind → verify | `Jenkinsfile.local` | Jenkins, agent `ecom-local` |
+| Pipeline-as-code, **cloud**: build → push → gate → promote → bump | `Jenkinsfile.aws` | Jenkins, agent `ecom-buildx` |
 | Lint gate (ruff, hadolint, shellcheck, compose + structure contracts) | `scripts/ci/lint.sh` | Jenkins + `make ci-lint` |
 | Unit/contract tests, two tiers, JUnit output | `scripts/ci/unit-tests.sh`, `tests/` | Jenkins + `make ci-test` |
 | Multi-arch buildx build/push for all 10 services | `scripts/ci/build.sh` | Jenkins + `make ci-build` |
@@ -24,36 +25,64 @@ amd64 agent (an arm64 agent works too — see §4). ~180 lines of this file are 
 | One-command local run of the whole pipeline | `scripts/ci/all.sh` | `make ci` |
 | Service catalog the pipeline fans out over | `scripts/ci/lib/services.sh` | all of the above |
 
-**Nothing in this phase deploys anything.** The last step of a green build is a
-commit that changes two YAML lines per service. ArgoCD (Phase 5) reconciles them.
+**The cloud pipeline deploys nothing.** Its last step is a commit that changes two
+YAML lines per service (`image.repository`, `image.tag`); ArgoCD (Phase 5) reconciles
+them. `Jenkinsfile.local` is the deliberate exception: it installs the charts into a
+Kind cluster on the same machine, which is the fastest way to see a change running —
+and a test fails the build if `kubectl`/`helm upgrade` ever appears in the AWS one.
 
 ### Stage flow
 
 ```
-Prepare ─► Lint ─► Unit tests ─► Build & push ─► Trivy security gate ─► Promote images ─► GitOps bump
-             │          │              │                  │                   │               │
-     ruff/hadolint  pytest in      per service      per service        imagetools      push branch
-     compose parity  python:3.12   load→smoke→push  scan pushed ref     create          gitops/main
-     structure tests (both tiers)  (amd64) → (multi-arch)               latest          (trunk only)
+Jenkinsfile.aws    (agent ecom-buildx)
+  Prepare ─► Lint ─► Unit tests ─► Build & push ─► Trivy security gate ─► Promote images ─► GitOps bump
+    │          │          │             │                  │                   │                │
+  doctor +   ruff etc  pytest in    load → smoke →     scan the pushed    imagetools        commit tags to
+  buildx +   compose   python:3.12  push amd64+arm64   refs (both archs)  create → latest   gitops/main
+  QEMU,login parity    both tiers   tag = git SHA                                           (trunk only)
+
+Jenkinsfile.local  (agent ecom-local)
+  Prepare ─► Lint ─► Unit tests ─► Build images ─► Smoke test ─► Trivy scan ─► Deploy to Kind ─► Verify deployment
+    │                                        │                                    │                  │
+  make doctor,                    push to localhost:5001                 make helm-install-local   rollout status +
+  find kubeconfig                                                                    (IMAGE_TAG)     scripts/test.sh
 ```
 
-Pipeline stages worth knowing before your first failure:
+Both files follow two rules: **declarative only** (no `script { }` block anywhere —
+`check_jenkinsfile.py` fails the lint if one appears) and **a stage is a single `sh` call
+into `scripts/ci/` or the Makefile.** Values live in the `environment {}` block and every
+`sh` is single-quoted, so Groovy interpolates nothing into a shell command. There is no
+per-service fan-out — `build.sh` bounds its own concurrency (`ECOM_BUILD_PARALLEL`) and
+writes one `.ci-output/images.txt`.
 
-- **`Prepare`** — validates parameters (they are interpolated into shell, so they
-  are whitelisted), resolves the tag (`<branch>-<sha>`, or `pr-<n>-<sha>`), creates
-  the buildx builder, registers QEMU, and logs in to the registry with
-  `--password-stdin` into a per-build `DOCKER_CONFIG`.
-- **`Build & push`** — per service: `--load` (host arch) → smoke test → `--push`
-  (amd64+arm64, `--cache`, `retry(2)`). The push reuses the layers the load already
-  built, so it costs an upload, not a rebuild.
-- **`Trivy security gate`** — scans the **pushed** candidate (the bytes the cluster
-  will pull, both architectures). `catchError` per branch so one finding does not
-  cancel its nine siblings; the stage then aggregates and decides.
+`Jenkinsfile.aws` stages worth knowing before your first failure:
+
+- **`Prepare`** — runs `make doctor`, creates the buildx builder, registers QEMU, and
+  logs in to the registry with `--password-stdin` into a per-build `DOCKER_CONFIG`. No
+  tag is computed in Groovy: `build.sh` derives the candidate tag from the git SHA
+  (`-dirty` if the tree is not clean), and `scan.sh`/`--promote` derive the same value,
+  so a rebuild of one commit bumps nothing.
+- **`Build & push`** — `--load` (host arch) → `smoke.sh` → `--push` (amd64+arm64,
+  `--cache`, `retry(2)`). The push reuses the layers the load already built, so it
+  costs an upload, not a rebuild.
+- **`Trivy security gate`** — one `scan.sh` call over the **pushed** candidates (the
+  bytes the cluster will pull, both architectures).
 - **`Promote images`** — `docker buildx imagetools create` retags candidate →
   `latest` **inside the registry**. No rebuild ⇒ the promoted image is byte-identical
   to the one that passed the gate.
-- **`GitOps bump`** — trunk only. Rewrites `image.repository`/`image.tag` and pushes
-  `gitops/main`. ArgoCD syncs. Rollback = `git revert` + ArgoCD.
+- **`GitOps bump`** — trunk only (`env.BRANCH_NAME == 'main'`). Rewrites
+  `image.repository`/`image.tag` and pushes `gitops/main`. ArgoCD syncs. Rollback =
+  `git revert` + ArgoCD.
+
+`Jenkinsfile.local` adds the two stages the cloud pipeline is not allowed to have:
+
+- **`Deploy to Kind`** — `make helm-install-local IMAGE_TAG=<this build>`, with
+  `KUBECONFIG` from `make -s kind-kubeconfig` (the path terraform wrote, else
+  `~/.kube/config`); images come from `localhost:5001`, the registry
+  `terraform/local-kind` runs. No credentials.
+- **`Verify deployment`** — `kubectl -n ecom wait --for=condition=Available deployment
+  --all`, then `BASE=http://localhost:8080 ./scripts/test.sh` through the ingress.
+  `DEPLOY=false` stops the pipeline after the scan.
 
 ---
 
@@ -166,8 +195,13 @@ credentials:
 
 ### Agent node
 
-Manage Jenkins → Nodes → New Node → **Permanent agent**, labels `ecom-buildx linux
-docker amd64 arm-capable`, launch method "Attach JNLP agent" (or inbound SSH):
+Two labels, one per pipeline: `ecom-buildx` (docker, buildx, QEMU, trivy) for
+`Jenkinsfile.aws`, and `ecom-local` (docker, make, python3, helm, kubectl, kind) for
+`Jenkinsfile.local`. They can be the same box — give it both labels — but only the
+local one needs a Kind cluster and a kubeconfig.
+
+Manage Jenkins → Nodes → New Node → **Permanent agent**, labels `ecom-buildx ecom-local
+linux docker amd64 arm-capable`, launch method "Attach JNLP agent" (or inbound SSH):
 
 ```bash
 # On the agent box, once:
@@ -208,8 +242,8 @@ Notes that save hours:
   compilation. Rule of thumb: multi-arch here costs ~2× the wall clock of
   single-arch, not 10×. If a build ever needs gcc for an sdist on arm64, add
   `--set-platform` caching (`--cache`) and prefer an arm64 agent for that service.
-- Emulation is slow enough that the 75-minute stage timeout in the `Jenkinsfile` is
-  deliberate. Cold (no builder cache, 10 services × 2 platforms): **25–40 min**.
+- Emulation is slow enough that the 75-minute pipeline timeout in `Jenkinsfile.aws` is
+  deliberate (`Jenkinsfile.local` builds one platform and gets 40 minutes). Cold (no builder cache, 10 services × 2 platforms): **25–40 min**.
   Warm cache: **8–14 min**. If you see 40 min repeatedly, check `docker buildx du`
   for a cache that is not being used (`--cache` is push-mode only).
 
@@ -224,15 +258,21 @@ Policy, in the order it is applied:
    accept. Entries must be advisory IDs (`CVE-…`/`GHSA-…`) and `tests/test_ci_hygiene.py`
    caps the list at 40 and rejects globs, so the allowlist cannot quietly become the
    real policy.
-4. `SCAN_GATE=true` ⇒ findings fail the build; `false` ⇒ build is UNSTABLE with the
-   report attached (use during the first week, then turn it back on).
+4. `SCAN_GATE=true` ⇒ `--mode gate`, findings fail the build. `false` ⇒
+   `--mode report`, the stage exits 0 and the findings are in the artifacts (use
+   during the first week, then turn it back on). It is `false` by default in
+   `Jenkinsfile.local` and `true` in `Jenkinsfile.aws`.
 
-DB downloads are ~60 MB; `Prepare` warms them once
-(`scripts/ci/scan.sh --download-db-only`) so ten parallel branches don't race.
-Air-gapped agents: mount a cached `/root/.cache/trivy-db` and pass
-`--skip-db-update`.
+The DB download (~60 MB) is paid once per build: there is a single `scan.sh`
+invocation, no fan-out to race. Air-gapped agents: mount a cached
+`/root/.cache/trivy-db` and pass `--skip-db-update`.
 
-Reports per service: `.ci-output/trivy-<svc>/{junit-trivy.xml,*.json,*.sarif,*.txt}`.
+`Jenkinsfile.local` scans refs in `localhost:5001`, which is plain HTTP, so it sets
+`TRIVY_INSECURE=1`. Without it trivy fails the pull with an x509 error and the stage
+reports a *scan error* instead of a verdict. Leave it off for docker.io/ECR.
+
+Reports: `.ci-output/trivy/<ref>.{json,sarif,txt}` plus `.ci-output/junit-trivy.xml`,
+which both pipelines publish with `junit`.
 SARIF feeds GitHub code scanning / DefectDojo later (Phase 6); JUnit is what turns
 the build yellow/red in the UI.
 
@@ -242,6 +282,10 @@ the build yellow/red in the UI.
 |---|---|---|---|
 | `dockerhub-creds` | Username/password | Docker Hub **patron/read-write on `ecom-*` only**, never the account password | `Prepare` login, `Build & push` |
 | `gitops-token` | Username/password | GitHub **fine-grained PAT**: `contents:write` on this repo, nothing else | `GitOps bump` |
+
+`Jenkinsfile.local` uses **no credentials at all**: `localhost:5001` is an
+unauthenticated registry on the same host, and the kubeconfig it deploys with is
+whatever `terraform/local-kind` wrote.
 
 Rules that keep the blast radius small:
 
@@ -296,9 +340,11 @@ docker run --rm -it --entrypoint sh ecom-product:<tag> -c 'curl -sf localhost:80
 echo "$HUB_TOKEN" | docker login -u mylab12345 --password-stdin
 bash scripts/ci/build.sh --push --registry docker.io/mylab12345 --services product --cache
 
-# 3. Jenkins: create the Multibranch Pipeline (or a Pipeline job → Jenkinsfile from SCM),
-#    run it once with PUSH_IMAGES=false to validate agent + lint + tests,
-#    then with SCAN_GATE=false to validate build+push, then flip both on.
+# 3. Jenkins: create two Pipeline jobs from SCM —
+#      • Script Path `Jenkinsfile.aws`,   agent label ecom-buildx
+#      • Script Path `Jenkinsfile.local`, agent label ecom-local
+#    First AWS run with SCAN_GATE=false + GITOPS_ENABLED=false (validates agent, lint,
+#    tests, build, push), then PROMOTE_LATEST=true, then GITOPS_ENABLED=true.
 ```
 
 Staged rollout of the gates matters: turning on push + gate + bump on the first run
@@ -307,7 +353,8 @@ values-file problem. Three runs, each isolating one class of failure.
 
 | What you should see | Where |
 |---|---|
-| 10 branches, ~4 concurrent, per-service logs | `Build & push` stage view |
+| one build line per service, concurrency bounded by `ECOM_BUILD_PARALLEL` | `Build & push` stage log |
+| `build-<svc>.log` per service | Build Artifacts (`.ci-output/**`) |
 | `manifest lists: linux/amd64/linux/arm64, …` | build log tail per service (`build.sh` verifies it) |
 | `junit-structure.xml`, `junit-app.xml`, `junit-trivy.xml` | Test Result tab |
 | `images.txt`, `summary.md`, `trivy-*/`, `build-*.log` | Build Artifacts (`.ci-output/**`) |
@@ -329,33 +376,42 @@ the agent workspace to the SHA it started from.
 | `no matching manifest for linux/arm64/v8` (on `docker run`) | you ran the amd64 image on arm | `--platform linux/amd64` or rebuild; our manifest list covers both |
 | `trivy: database lookup failure` / `toomanyrequests` | ghcr.io rate limit | `--download-db-only` in a nightly job; mount a cached DB volume |
 | `SECURITY GATE FAILED — … CRITICAL=1` | real finding with a fix | bump the pinned dep / the base image; only then `.trivyignore` with an owner |
-| `expected N manifest lines, got M` | a parallel branch wrote the wrong `--images-file` | never edit that path by hand; it is derived per service in `Jenkinsfile` |
+| `no image manifest produced` / bump says "nothing to do" | `build.sh` never reached the push, or `SERVICES` matched nothing | `bash scripts/ci/build.sh --list-services --services "$SERVICES"` prints what it resolved |
 | `helm-charts/<svc>/values.yaml has an image: block this tool will not rewrite` | someone hand-edited the stub into an unexpected shape | restore the 3-line `image:` mapping (see `helm-charts/product/values.yaml`) — refusing to write is intentional |
 | bump pushes nothing, "already current" | tag unchanged (rebuild of the same commit) | expected; it is idempotent by design |
 | `push rejected — replaying the bump on top of origin/gitops/main` and the build still goes green | a human or another branch's build moved the branch mid-run | no action: the rewrite is deterministic, so `gitops-bump.sh` replayed it. Confirm both bumps landed: `git log --oneline origin/gitops/main \| head` |
 | `rebase onto origin/gitops/main failed — most likely two bumps touched the same image.tag` | two builds disagree about which SHA a service should run | the loser's own commit is still valid — re-run `make gitops-bump PUSH=1` with that build's `.ci-output/images.txt`, or hand-edit. Auto-resolving is deliberately impossible: whichever tag you pick, a deployment silently disagrees with a green build |
 | `ERROR: The project … cannot be built` (GitHub) | hook not firing | §7 verify `curl -X POST …/github-webhook/` |
-| build is green but nothing deployed | correct for Phase 2 | deploys start in Phase 4/5 (Helm + ArgoCD) |
+| AWS build is green but nothing deployed | correct by design | `Jenkinsfile.aws` only commits tags — ArgoCD rolls out. To see it in a cluster now, run `Jenkinsfile.local` |
+| local build green, pods `ImagePullBackOff` | Kind cannot reach the registry | `kubectl -n ecom describe pod` — the node needs the `localhost:5001` mirror config from `terraform/local-kind` |
 
 ## 10. Parameters worth knowing
 
-| Parameter | Default | Notes |
-|---|---|---|
-| `SERVICES` | `auto` | `auto` = only services whose files changed (`build.sh` resolves it); `all` forces 10 |
-| `REGISTRY` | *(empty)* | empty ⇒ build + scan locally, no push, no promote, no bump |
-| `PLATFORMS` | `linux/amd64,linux/arm64` | drop arm64 for a fast amd64-only path on feature branches |
-| `STRICT_TOOLS` | `true` | missing trivy/hadolint fails the build instead of skipping |
-| `SCAN_GATE` | `true` | `false` = UNSTABLE + report, no block |
-| `GITOPS_ENABLED` | `true` | also gated on trunk branch + push enabled |
-| `RUN_COMPOSE_E2E` | `false` | Phase 1 Compose + `scripts/test.sh`; slow, needs free ports |
-| `CLEAN_WS` | `false` | deletes only `.docker/**` (credential hygiene), not the buildx cache |
+Deliberately few — a parameter is a knob somebody has to understand at 3 a.m.
+`STRICT_TOOLS` and the registry/tag knobs still exist as environment variables
+(`.env.example`), they are just not per-build choices any more.
+
+| Parameter | Pipeline | Default | Notes |
+|---|---|---|---|
+| `SERVICES` | both | `all` | `all`, or a comma list; `auto` (only changed services) also works — `build.sh` resolves it |
+| `SCAN_GATE` | both | `false` local / `true` aws | `false` = `scan.sh --mode report`: findings in the artifacts, build stays green |
+| `IMAGE_TAG` | local | *(empty)* | empty ⇒ `local-<build number>`. The AWS pipeline has no tag parameter: `build.sh` derives the git SHA |
+| `DEPLOY` | local | `true` | `false` ⇒ stop after the scan; leave the Kind cluster alone |
+| `REGISTRY` | aws | `docker.io/mylab12345` | the **org/namespace**, not a repo |
+| `PLATFORMS` | aws | `linux/amd64,linux/arm64` | drop arm64 for a fast amd64-only path on a feature branch |
+| `PROMOTE_LATEST` | aws | `true` | `false` ⇒ candidate tag only, `latest` untouched |
+| `GITOPS_ENABLED` | aws | `true` | also gated on `BRANCH_NAME == main` |
+| `GITOPS_BRANCH` | aws | `gitops/main` | must not equal the base branch — `gitops-bump.sh` refuses |
 
 ## 11. Deliberately not in Phase 2
 
-- **Deploying.** No `kubectl`/`helm upgrade`/`argocd sync` in CI. Phase 4 ships the
-  charts, Phase 5 wires ArgoCD; the bump stage is the seam between them.
+- **Deploying to anything shared.** No `kubectl`/`helm upgrade`/`argocd sync` in
+  `Jenkinsfile.aws`, and `check_jenkinsfile.py` fails the lint if one appears. Phase 4
+  ships the charts, Phase 5 wires ArgoCD; the bump stage is the seam between them.
+  `Jenkinsfile.local` deploys to a Kind cluster on the build agent, which is a laptop,
+  not a blast radius.
 - **Chart publishing.** `helm-charts/*/values.yaml` are contract stubs now; the
-  chart bodies arrive in Phase 4 (`Jenkinsfile` bump works either way — it creates
+  chart bodies arrive in Phase 4 (`Jenkinsfile.aws` bump works either way — it creates
   the `image:` block if a chart directory is new).
 - **Image signing / SBOM attestation** (`cosign`, `--provenance`, `--sbom`): Phase 6,
   with the OCI registry layout and the policy controller. `ECOM_PROVENANCE=1`
@@ -369,11 +425,13 @@ the agent workspace to the SHA it started from.
 
 - [ ] `bash scripts/ci/all.sh --doctor` → no `MISSING` lines except `yq`
 - [ ] `make ci` green locally
-- [ ] Jenkins `Prepare` prints the toolchain table and creates `ecom-buildx`
+- [ ] Jenkins `Prepare` runs `make doctor` clean and creates the `ecom-buildx` builder
 - [ ] `docker run --rm --platform linux/arm64 alpine uname -m` → `aarch64`
-- [ ] First Jenkins build with `PUSH_IMAGES=false` → green through `Unit tests`
-- [ ] Second build with `REGISTRY` set, `SCAN_GATE=false` → images + `latest` absent
+- [ ] First `Jenkinsfile.aws` build with `GITOPS_ENABLED=false` → images pushed, no bump commit
+- [ ] Second build with `PROMOTE_LATEST=false` → candidate tag only, `latest` untouched
 - [ ] Third build with everything on → 10 images in the registry, one commit on `gitops/main`
+- [ ] One `Jenkinsfile.local` build → 10 images in `localhost:5001`, pods `Running` in Kind,
+      `scripts/test.sh` green through the ingress
 - [ ] `gitops/main` commit diff touches **only** `image.repository`/`image.tag`
 - [ ] GitHub shows a green check on the commit that triggered the build
 - [ ] Re-running the same commit produces **no** new bump commit (idempotency)
