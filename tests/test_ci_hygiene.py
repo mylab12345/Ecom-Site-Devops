@@ -389,3 +389,97 @@ def test_every_ci_script_help_works():
                               check=False, timeout=25)
         assert proc.returncode == 0, f"{script.name} --help failed: {proc.stderr[:400]}"
         assert f"scripts/ci/{script.name}" in proc.stdout, f"{script.name} --help printed nothing useful"
+
+
+# ── Phase 5: ArgoCD GitOps contracts ────────────────────────────────────────
+def test_argocd_project_declares_ecom_and_namespaces():
+    proj_path = REPO_ROOT / "argocd" / "projects" / "ecom.yaml"
+    assert proj_path.is_file(), "argocd/projects/ecom.yaml missing (Phase 5 deliverable)"
+    text = proj_path.read_text(encoding="utf-8")
+    assert "kind: AppProject" in text, "ecom.yaml must define AppProject"
+    assert "name: ecom" in text, "project name must be ecom"
+    for ns in ("ecom", "ingress-nginx"):
+        assert f"namespace: {ns}" in text, f"project must permit destination namespace {ns}"
+
+
+@pytest.mark.parametrize("name", SERVICE_NAMES)
+def test_argocd_application_exists_and_matches_contract(name):
+    app_path = REPO_ROOT / "argocd" / "applications" / f"{name}.yaml"
+    assert app_path.is_file(), f"argocd/applications/{name}.yaml missing"
+    text = app_path.read_text(encoding="utf-8")
+    assert "kind: Application" in text, f"{name}.yaml must define Application"
+    assert "project: ecom" in text, f"{name}.yaml must belong to project ecom"
+    assert "targetRevision: gitops/main" in text, f"{name}.yaml must track gitops/main"
+    assert f"path: helm-charts/{name}" in text, f"{name}.yaml must point to helm-charts/{name}"
+    assert "selfHeal: true" in text, f"{name}.yaml must enable selfHeal"
+    assert "prune: true" in text, f"{name}.yaml must enable prune"
+
+
+def test_argocd_applicationset_and_root_app():
+    appset = REPO_ROOT / "argocd" / "applicationset.yaml"
+    assert appset.is_file(), "argocd/applicationset.yaml missing"
+    appset_text = appset.read_text(encoding="utf-8")
+    assert "kind: ApplicationSet" in appset_text
+    for name in SERVICE_NAMES:
+        assert f"name: {name}" in appset_text, f"applicationset generator missing {name}"
+
+    root_app = REPO_ROOT / "argocd" / "root-app.yaml"
+    assert root_app.is_file(), "argocd/root-app.yaml missing"
+    root_text = root_app.read_text(encoding="utf-8")
+    assert "kind: Application" in root_text
+    assert "path: argocd/applications" in root_text
+
+
+# ── Phase 6: Observability & Security contracts ──────────────────────────────
+def test_observability_prometheus_stack_values_and_rules():
+    p_values = REPO_ROOT / "observability" / "prometheus" / "kube-prometheus-stack-values.yaml"
+    assert p_values.is_file(), "observability/prometheus/kube-prometheus-stack-values.yaml missing"
+    p_text = p_values.read_text(encoding="utf-8")
+    assert "kubernetes.io/arch: arm64" in p_text, "Prometheus values should target arm64 Graviton"
+
+    rules = REPO_ROOT / "observability" / "prometheus" / "rules" / "ecom-alerts.yaml"
+    assert rules.is_file(), "observability/prometheus/rules/ecom-alerts.yaml missing"
+    rules_text = rules.read_text(encoding="utf-8")
+    assert "kind: PrometheusRule" in rules_text
+    for alert in ("EcomServiceHighErrorRate", "EcomServiceHighLatencyP99", "EcomServiceInstanceDown"):
+        assert alert in rules_text, f"missing expected alert rule: {alert}"
+
+    sm = REPO_ROOT / "observability" / "prometheus" / "servicemonitors" / "ecom-servicemonitors.yaml"
+    assert sm.is_file(), "ecom-servicemonitors.yaml missing"
+    sm_text = sm.read_text(encoding="utf-8")
+    for name in SERVICE_NAMES:
+        assert name in sm_text, f"ServiceMonitor must monitor {name}"
+
+
+def test_observability_grafana_dashboards_validity():
+    import json
+    dash_dir = REPO_ROOT / "observability" / "grafana" / "dashboards"
+    expected = ("ecom-overview.json", "service-detail.json", "ecom-business-slo.json")
+    for fname in expected:
+        fpath = dash_dir / fname
+        assert fpath.is_file(), f"{fname} missing in {dash_dir}"
+        with open(fpath, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data.get("title"), f"{fname} missing title"
+        assert len(data.get("panels", [])) >= 4, f"{fname} has insufficient panels"
+
+
+def test_observability_jaeger_loki_and_trivy():
+    jaeger = REPO_ROOT / "observability" / "jaeger" / "jaeger-all-in-one.yaml"
+    assert jaeger.is_file(), "jaeger-all-in-one.yaml missing"
+    jaeger_text = jaeger.read_text(encoding="utf-8")
+    for port in ("16686", "4317", "4318"):
+        assert port in jaeger_text, f"Jaeger should expose port {port}"
+
+    loki = REPO_ROOT / "observability" / "loki" / "loki-values.yaml"
+    promtail = REPO_ROOT / "observability" / "loki" / "promtail-values.yaml"
+    assert loki.is_file()
+    assert promtail.is_file()
+
+    trivy_cron = REPO_ROOT / "observability" / "security" / "trivy-cronjob.yaml"
+    assert trivy_cron.is_file(), "trivy-cronjob.yaml missing"
+    trivy_text = trivy_cron.read_text(encoding="utf-8")
+    assert "kind: CronJob" in trivy_text
+    assert "0 2 * * *" in trivy_text, "Trivy cronjob should run nightly at 02:00"
+    assert "--severity HIGH,CRITICAL" in trivy_text
+

@@ -2,7 +2,10 @@
         ci ci-deps ci-lint ci-test ci-test-docker ci-build ci-push ci-scan ci-smoke ci-all ci-clean \
         gitops-bump gitops-dry ci-plan doctor \
         tf-fmt tf-validate tf-plan-local tf-apply-local tf-destroy-local tf-plan-eks tf-apply-eks \
-        helm-lint helm-template helm-deps kind-up kind-down eks-kubeconfig
+        helm-lint helm-template helm-deps kind-up kind-down eks-kubeconfig \
+        helm-install-local helm-uninstall-local \
+        argocd-install argocd-admin-pass argocd-apps argocd-status argocd-sync \
+        obs-up obs-down obs-jaeger obs-prometheus obs-loki obs-security trivy-scan-cluster
 
 # ── Phase 1: local stack ─────────────────────────────────────────────────────
 help: ## Show help
@@ -172,4 +175,70 @@ helm-uninstall-local: ## Uninstall all charts from Kind
 	done
 	@helm uninstall ingress-nginx -n ingress-nginx || true
 	@helm uninstall network-policies -n ecom || true
+
+# ── Phase 5: GitOps — ArgoCD ───────────────────────────────────────────────
+argocd-install: ## Install ArgoCD into the argocd namespace
+	@kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+	@kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.10.4/manifests/install.yaml
+	@echo "ArgoCD manifests applied. Waiting for pods..."
+
+argocd-admin-pass: ## Retrieve the initial admin password for ArgoCD
+	@kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+
+argocd-apps: ## Bootstrap all ArgoCD applications via root app-of-apps
+	@kubectl apply -f argocd/projects/ecom.yaml
+	@kubectl apply -f argocd/root-app.yaml
+	@echo "Bootstrap complete: AppProject 'ecom' and root Application applied."
+
+argocd-status: ## List all ArgoCD applications and their sync/health statuses
+	@which argocd >/dev/null 2>&1 && argocd app list || kubectl get applications -n argocd
+
+argocd-sync: ## Trigger sync for all ecom microservice applications
+	@for svc in identity product inventory cart order payment shipping notification review gateway ingress-nginx network-policies; do \
+	  argocd app sync ecom-$$svc --prune 2>/dev/null || echo "Skipping sync for ecom-$$svc (CLI or app not ready)"; \
+	done
+
+# ── Phase 6: Observability & Security ──────────────────────────────────────
+obs-ns: ## Create observability namespace
+	@kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f -
+
+obs-jaeger: obs-ns ## Deploy Jaeger all-in-one tracing
+	@kubectl apply -f observability/jaeger/jaeger-all-in-one.yaml
+	@kubectl apply -f observability/jaeger/otel-collector-config.yaml
+
+obs-prometheus: obs-ns ## Deploy Prometheus and Grafana stack
+	@helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+	@helm repo update prometheus-community 2>/dev/null || true
+	@helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+	  -n observability -f observability/prometheus/kube-prometheus-stack-values.yaml || true
+	@kubectl apply -f observability/prometheus/rules/ecom-alerts.yaml || true
+	@kubectl apply -f observability/prometheus/servicemonitors/ecom-servicemonitors.yaml || true
+	@kubectl apply -f observability/grafana/datasources.yaml || true
+	@kubectl apply -f observability/grafana/dashboards-provisioning.yaml || true
+
+obs-loki: obs-ns ## Deploy Loki and Promtail log aggregation
+	@helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null || true
+	@helm repo update grafana 2>/dev/null || true
+	@helm upgrade --install loki grafana/loki -n observability -f observability/loki/loki-values.yaml || true
+	@helm upgrade --install promtail grafana/promtail -n observability -f observability/loki/promtail-values.yaml || true
+
+obs-security: ## Deploy in-cluster security: Pod Security Standards, RBAC, and nightly Trivy CronJob
+	@kubectl apply -f observability/security/pod-security-standards.yaml || true
+	@kubectl apply -f observability/security/rbac.yaml || true
+	@kubectl apply -f observability/security/trivy-cronjob.yaml || true
+
+obs-up: obs-jaeger obs-prometheus obs-loki obs-security ## Deploy full observability and security stack
+	@echo "Observability and security stack deployed."
+
+obs-down: ## Tear down observability components
+	@helm uninstall kube-prometheus-stack -n observability 2>/dev/null || true
+	@helm uninstall loki -n observability 2>/dev/null || true
+	@helm uninstall promtail -n observability 2>/dev/null || true
+	@kubectl delete -f observability/jaeger/jaeger-all-in-one.yaml 2>/dev/null || true
+	@kubectl delete -f observability/security/trivy-cronjob.yaml 2>/dev/null || true
+	@kubectl delete -f observability/security/rbac.yaml 2>/dev/null || true
+
+trivy-scan-cluster: ## Trigger an immediate manual Trivy scan job in cluster
+	@kubectl create job --from=cronjob/trivy-nightly-cluster-scan trivy-manual-$$(date +%s) -n observability
+
 

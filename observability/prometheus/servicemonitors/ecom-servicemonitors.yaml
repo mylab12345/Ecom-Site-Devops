@@ -1,0 +1,38 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ecom-services-monitor
+  namespace: observability
+  labels:
+    app.kubernetes.io/part-of: ecom
+    release: kube-prometheus-stack
+    eci.phase: "6"
+spec:
+  namespaceSelector:
+    matchNames:
+      - ecom
+  selector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - identity
+          - product
+          - inventory
+          - cart
+          - order
+          - payment
+          - shipping
+          - notification
+          - review
+          - gateway
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+          targetLabel: service
+        - sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: job

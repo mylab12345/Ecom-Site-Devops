@@ -1,0 +1,65 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: ecom
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: ecom
+    eci.phase: "5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "E-Commerce Microservices Platform — Production GitOps Project"
+  sourceRepos:
+    - "https://github.com/mylab12345/Ecom-Site-Devops.git"
+    - "https://github.com/mylab12345/Ecom-Site-Devops"
+  destinations:
+    - namespace: ecom
+      server: https://kubernetes.default.svc
+    - namespace: ingress-nginx
+      server: https://kubernetes.default.svc
+    - namespace: observability
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "networking.k8s.io"
+      kind: IngressClass
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: "apps"
+      kind: Deployment
+    - group: "apps"
+      kind: ReplicaSet
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "policy"
+      kind: PodDisruptionBudget
+    - group: "networking.k8s.io"
+      kind: Ingress
+    - group: "networking.k8s.io"
+      kind: NetworkPolicy
+    - group: "monitoring.coreos.com"
+      kind: ServiceMonitor
+    - group: "monitoring.coreos.com"
+      kind: PrometheusRule
+  roles:
+    - name: read-only
+      description: Read-only access to ecom applications
+      policies:
+        - p, proj:ecom:read-only, applications, get, ecom/*, allow
+      groups:
+        - developers
+    - name: admin
+      description: Full sync and management access to ecom applications
+      policies:
+        - p, proj:ecom:admin, applications, *, ecom/*, allow
+      groups:
+        - devops-admins

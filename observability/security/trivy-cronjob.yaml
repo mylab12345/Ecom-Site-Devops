@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trivy-nightly-cluster-scan
+  namespace: observability
+  labels:
+    app.kubernetes.io/part-of: ecom
+    eci.phase: "6"
+    role: security-scanner
+spec:
+  # Run daily at 02:00 UTC
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: ecom
+            eci.phase: "6"
+            role: security-scanner
+        spec:
+          serviceAccountName: trivy-scanner
+          restartPolicy: OnFailure
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          tolerations:
+            - key: "spot"
+              operator: "Equal"
+              value: "true"
+              effect: "NoSchedule"
+          containers:
+            - name: trivy-scanner
+              image: aquasec/trivy:0.50.0
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  echo "Starting nightly in-cluster Trivy vulnerability scan for namespace 'ecom'..."
+                  trivy k8s \
+                    --namespace ecom \
+                    --severity HIGH,CRITICAL \
+                    --ignore-unfixed \
+                    --report summary \
+                    --exit-code 0
+                  echo "Trivy nightly security scan completed successfully."
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 256Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1024Mi

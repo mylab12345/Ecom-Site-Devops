@@ -1,0 +1,91 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ecom-microservices
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: ecom
+    eci.phase: "5"
+spec:
+  generators:
+    - list:
+        elements:
+          - name: identity
+            port: "8001"
+            tier: critical
+            prefix: /api/auth
+          - name: product
+            port: "8002"
+            tier: stateless
+            prefix: /api/products
+          - name: inventory
+            port: "8003"
+            tier: stateless
+            prefix: /api/inventory
+          - name: cart
+            port: "8004"
+            tier: stateless
+            prefix: /api/cart
+          - name: order
+            port: "8005"
+            tier: critical
+            prefix: /api/orders
+          - name: payment
+            port: "8006"
+            tier: critical
+            prefix: /api/payments
+          - name: shipping
+            port: "8007"
+            tier: critical
+            prefix: /api/shipments
+          - name: notification
+            port: "8008"
+            tier: stateless
+            prefix: /api/notifications
+          - name: review
+            port: "8009"
+            tier: stateless
+            prefix: /api/reviews
+          - name: gateway
+            port: "8080"
+            tier: edge
+            prefix: /
+  template:
+    metadata:
+      name: "ecom-{{name}}"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/name: "{{name}}"
+        app.kubernetes.io/part-of: ecom
+        eci.service: "{{name}}"
+        eci.tier: "{{tier}}"
+        eci.phase: "5"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: ecom
+      source:
+        repoURL: https://github.com/mylab12345/Ecom-Site-Devops.git
+        targetRevision: gitops/main
+        path: "helm-charts/{{name}}"
+        helm:
+          valueFiles:
+            - values.yaml
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: ecom
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ApplyOutOfSyncOnly=true
+          - PrunePropagationPolicy=foreground
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
