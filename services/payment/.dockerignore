@@ -1,0 +1,23 @@
+# Build-context hygiene — services/payment IS the Docker build context, so
+# anything listed here is junk or a secret that must never enter a layer
+# (a stray .env would otherwise be baked into every published image).
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+venv/
+.venv/
+.idea/
+.vscode/
+*.swp
+.DS_Store

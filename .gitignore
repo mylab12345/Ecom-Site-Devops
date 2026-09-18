@@ -7,8 +7,10 @@ venv/
 .env
 .env.local
 
-# Docker
-.dockerignore
+# Docker / buildx
+# (`.dockerignore` files are deliberately NOT ignored: each services/<name>/
+#  .dockerignore is part of the build contract and must be reviewable in git.)
+.docker/
 
 # Terraform
 .terraform/
@@ -33,3 +35,13 @@ logs/
 # Volumes
 postgres_data/
 redis_data/
+rabbitmq_data/
+
+# Phase 2 CI artifacts (JUnit, trivy reports, build logs, image manifest).
+# Regenerated every run; Jenkins archives them, git must not carry them.
+.ci-output/
+pytest-of-*/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

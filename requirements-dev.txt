@@ -1,0 +1,7 @@
+# Dev/CI tooling only — service runtime deps stay in services/*/requirements.txt.
+# Jenkins installs this in the "Unit tests" stage (inside python:3.12-slim);
+# locally: make ci-deps
+# Pinned to what the pipeline is validated against (Phase 2, 2026-09).
+pytest==9.1.1
+ruff==0.16.8
+PyYAML==6.0.2

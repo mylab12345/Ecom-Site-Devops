@@ -1,0 +1,57 @@
+# helm-charts/payment/values.yaml — Phase 2 contract stub.
+#
+# Only the image block is owned by CI: scripts/ci/gitops-bump.sh rewrites
+# `image.repository` + `image.tag` after build.sh pushes a multi-arch image, and
+# ArgoCD (Phase 5) syncs on that commit. Phase 4 turns this stub into the full
+# chart (deployment/service/ingress/HPA/NetworkPolicy); keep the two image keys
+# and their 2-space indentation or the bump refuses to write.
+#
+# Do NOT hand-edit image.* — change the deployment, the pipeline bumps the tag.
+
+replicaCount: 2
+
+image:
+  repository: docker.io/mylab12345/ecom-payment
+  tag: "0.0.0+phase1-placeholder"
+  pullPolicy: IfNotPresent
+
+# Container + Service port. Mirrors services/payment/Dockerfile EXPOSE and the
+# registry in scripts/ci/lib/services.sh (tests/test_ci_hygiene.py enforces it).
+service:
+  type: ClusterIP
+  port: 8006
+  targetPort: 8006
+
+containerPort: 8006
+
+probes:
+  readiness:
+    path: /health
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    failureThreshold: 6
+  liveness:
+    path: /health
+    initialDelaySeconds: 25
+    periodSeconds: 20
+    failureThreshold: 6
+
+metrics:
+  enabled: true
+  path: /metrics
+  port: 8006
+
+# Env is assembled from a ConfigMap in Phase 4; secrets come from SOPS/Vault and
+# are referenced by name here — never by value.
+config:
+  SERVICE_NAME: "payment-service"
+  LOG_LEVEL: "info"
+  PROVIDER_SECRET_REF: "ecom-payment-provider"   # mock provider keys in a Secret
+  IDEMPOTENCY_WINDOW_SECONDS: "86400"
+# Phase 3 fills these from terraform outputs (node selectors for spot pools).
+scheduling:
+  architecture: arm64            # Graviton (m7g/m6g); amd64 images are built too
+  spotCapable: false
+  priorityClass: ecom-critical
+
+# Payment is money: on-demand nodes only (Phase 3), no spot eviction mid-capture.

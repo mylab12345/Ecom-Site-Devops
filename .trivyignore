@@ -1,0 +1,20 @@
+# Trivy allowlist for the Phase 2 security gate (scripts/ci/scan.sh --ignorefile).
+#
+# Policy — an entry here is an accepted risk, so it must be reviewable:
+#   • one advisory ID per line (CVE-YYYY-NNNNN or GHSA-xxxx-xxxx-xxxx);
+#     package globs and wildcards are rejected by tests/test_ci_hygiene.py
+#   • each entry gets a preceding comment with: why, owner, and the date to re-check
+#   • the gate ignores findings with no released fix (--ignore-unfixed) instead of
+#     pretending they are absent, so this list only ever holds *fixable* items we
+#     consciously defer
+#
+# Typical legitimate entries look like this (all currently empty on purpose —
+# Phase 1 ships with no accepted vulnerabilities):
+#
+#   # CVE-2024-XXXXX — libexpat: XML external entity, unreachable (we never parse
+#   #   untrusted XML). Owner: platform. Re-check at the next python:3.12-slim bump.
+#   CVE-2024-XXXXX
+#
+# Trivy also reads .trivyignore inside each scan target and supports
+# --ignorefile per-scan, so a service can hold a narrower exception if it ever
+# needs one. Prefer bumping the base image over editing this file.
